@@ -143,6 +143,16 @@ Each press prints a `raw ATT session summary` with `t_subscribe`, `t_write`, `t_
 do not move when you widen `conn_interval_min_ms`/`conn_interval_max_ms`, the firmware is ignoring
 the request and only a BLE 5.0 adapter will help.
 
+### When the system bus goes away
+
+If `bluetoothd` or the system bus restarts under the add-on, python-dbus keeps dispatching
+signals on a closed connection and bluezero's handler raises on every one of them. The log fills
+with identical `org.freedesktop.DBus.Error.Disconnected` tracebacks and the bridge never serves
+another press.
+
+The add-on now detects that and exits, and `run.sh` restarts it after five seconds. A restart is
+what actually recovers the service; staying up on a dead bus does not.
+
 ### Management sessions
 
 Two failure modes were seen repeatedly during a long device session and are now handled.

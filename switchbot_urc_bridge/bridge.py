@@ -1036,8 +1036,11 @@ async def _execute_remote_management(
                         return aes_ctr(key, iv, r[4:])
                     return aes_ctr(key, iv, r)
 
+                # The status poll's own reply *is* a status record, so for that one command the
+                # filter has to be off or the real answer is skipped and the step times out.
+                wants_status = plaintext == b"\x02"
                 raw = await _await(
-                    lambda r: bool(_decrypt(r)) and not _is_status(_decrypt(r)),
+                    lambda r: bool(_decrypt(r)) and (wants_status or not _is_status(_decrypt(r))),
                     timeout=timeout,
                 )
                 decoded = _decrypt(raw)
@@ -1400,6 +1403,32 @@ def publish_with_retry(
 
     register_application()
     periph.mainloop.run()
+
+
+def watch_dbus_connection() -> None:
+    """Exit when the system bus goes away instead of spinning on a dead connection.
+
+    If bluetoothd or the bus restarts under the add-on, python-dbus keeps dispatching signals on
+    a closed connection and bluezero's handler raises on every one of them. That buries the log
+    in identical tracebacks and the bridge never serves another press. Supervisor restarts the
+    add-on on exit, which does recover it, so failing fast is the useful behaviour.
+    """
+    import dbus
+
+    try:
+        bus = dbus.SystemBus()
+    except Exception as err:  # noqa: BLE001 - nothing works without the bus anyway
+        _LOG.error("no system bus: %s", err)
+        os._exit(1)
+
+    def _on_disconnect(_connection) -> None:
+        _LOG.error("the system bus closed; exiting so the add-on is restarted")
+        os._exit(1)
+
+    try:
+        bus.call_on_disconnection(_on_disconnect)
+    except AttributeError:
+        _LOG.info("this python-dbus has no disconnection callback; bus loss will not be detected")
 
 
 def add_bridge_characteristics(periph, device) -> None:
@@ -2349,6 +2378,7 @@ def main() -> None:
             f"BlueZ resolved {adapter_name} to {adapter_address}, but bluezero only listed: "
             f"{adapters}"
         )
+    watch_dbus_connection()
     dev = bz_adapter.Adapter(adapter_address)
     mac = dev.address
     _LOG.info(

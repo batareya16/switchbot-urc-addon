@@ -75,4 +75,17 @@ export DIRECT_ATT RAW_ATT_IDLE_TIMEOUT RAW_ATT_KEEPALIVE_INTERVAL \
   RAW_ATT_KEEPALIVE_WINDOW CONN_INTERVAL_MIN_MS CONN_INTERVAL_MAX_MS
 
 bashio::log.info "Starting SwitchBot URC Bridge on adapter ${ADAPTER} as '${NAME}'"
-exec python3 -u /bridge.py
+
+# The bridge exits on conditions it cannot recover from in place — most often the system bus
+# closing under it when bluetoothd restarts. Restarting it here is what actually recovers the
+# service; without this the add-on would simply stay down until someone noticed.
+while true; do
+  python3 -u /bridge.py
+  status=$?
+  if [ "${status}" -eq 0 ]; then
+    bashio::log.info "bridge exited normally"
+    break
+  fi
+  bashio::log.warning "bridge exited with status ${status}; restarting in 5s"
+  sleep 5
+done

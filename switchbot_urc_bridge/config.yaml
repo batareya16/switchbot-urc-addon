@@ -1,5 +1,5 @@
 name: SwitchBot URC Bridge
-version: "0.20.4"
+version: "0.21.0"
 slug: switchbot_urc_bridge
 description: >-
   Fake native SwitchBot target for receiving encrypted button commands directly from WoRWS.
@@ -11,6 +11,7 @@ arch:
   - armhf
 startup: application
 boot: manual
+
 # Let the base image's s6-overlay be PID 1 (required by the modern HA base images); otherwise
 # Supervisor injects its own init and s6 fails with "can only run as pid 1".
 init: false
