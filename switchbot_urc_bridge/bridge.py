@@ -870,9 +870,17 @@ async def _execute_remote_management(
     """
     from bleak import BleakClient, BleakScanner
 
-    # Current WoRWS firmware pushes periodic status notifications (first decrypted byte 3C/4E/4F)
-    # that are not command replies; skip them while waiting for a step's real response.
-    unsolicited = {0x3C, 0x4E, 0x4F}
+    # WoRWS pushes periodic status notifications that are not command replies. Their first byte
+    # is not fixed — 3C, 4A, 4C, 4D, 4E and 4F have all been captured — so an allowlist of it
+    # goes stale and the next status packet is taken as a reply, shifting every later response
+    # in the sequence by one. Every captured status record is sixteen bytes whose second byte is
+    # 2D or 30, and no real reply code collides with that.
+    command_codes = {0x00, 0x01, 0x02, 0x04, 0x05, 0x10, 0x11}
+
+    def _is_status(plaintext: bytes) -> bool:
+        if len(plaintext) != 16 or plaintext[1] not in (0x2D, 0x30):
+            return False
+        return plaintext[0] not in command_codes
     queue: "asyncio.Queue[bytes]" = asyncio.Queue()
 
     def _on_notify(_char, data) -> None:  # noqa: ANN001
@@ -1029,7 +1037,7 @@ async def _execute_remote_management(
                     return aes_ctr(key, iv, r)
 
                 raw = await _await(
-                    lambda r: bool(_decrypt(r)) and _decrypt(r)[0] not in unsolicited,
+                    lambda r: bool(_decrypt(r)) and not _is_status(_decrypt(r)),
                     timeout=timeout,
                 )
                 decoded = _decrypt(raw)
