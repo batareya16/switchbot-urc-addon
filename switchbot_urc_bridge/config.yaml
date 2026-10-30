@@ -1,0 +1,58 @@
+name: SwitchBot URC Bridge
+version: "0.19.32"
+slug: switchbot_urc_bridge
+description: >-
+  Fake native SwitchBot target for receiving encrypted button commands directly from WoRWS.
+url: https://github.com/batareya16/switchbot-urc-addon
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - armhf
+startup: application
+boot: manual
+# Let the base image's s6-overlay be PID 1 (required by the modern HA base images); otherwise
+# Supervisor injects its own init and s6 fails with "can only run as pid 1".
+init: false
+# BlueZ runs on the host; we talk to it over the system D-Bus and need raw BT access to run an
+# adapter in peripheral (GATT-server) mode.
+host_dbus: true
+host_network: true
+privileged:
+  - NET_ADMIN
+  - NET_RAW
+udev: true
+services:
+  - mqtt:want
+options:
+  adapter: hci1
+  remote_address: ""
+  name: HASS Light
+  mqtt_topic: switchbot_urc/button
+  discovery: true
+  diagnostic_scan: false
+  hci_trace: false
+  prewarm_remote_cache: false
+  direct_att: true
+  raw_att_idle_timeout: 6.0
+  raw_att_keepalive_interval: 1.0
+  raw_att_keepalive_window: 300.0
+  conn_interval_min_ms: 7.5
+  conn_interval_max_ms: 15.0
+  device_key: "00112233445566778899aabbccddeeff"
+schema:
+  adapter: str
+  remote_address: str
+  name: str
+  mqtt_topic: str
+  discovery: bool
+  diagnostic_scan: bool
+  hci_trace: bool
+  prewarm_remote_cache: bool
+  direct_att: bool?
+  raw_att_idle_timeout: float?
+  raw_att_keepalive_interval: float?
+  raw_att_keepalive_window: float?
+  conn_interval_min_ms: float?
+  conn_interval_max_ms: float?
+  device_key: str?
