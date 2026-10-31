@@ -1,5 +1,5 @@
 name: SwitchBot URC Bridge
-version: "0.21.0"
+version: "0.22.1"
 slug: switchbot_urc_bridge
 description: >-
   Fake native SwitchBot target for receiving encrypted button commands directly from WoRWS.

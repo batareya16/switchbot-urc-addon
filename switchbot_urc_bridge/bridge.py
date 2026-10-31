@@ -1405,6 +1405,38 @@ def publish_with_retry(
     periph.mainloop.run()
 
 
+def guard_bluezero_dbus(limit: int = 5) -> None:
+    """Exit after repeated D-Bus failures inside bluezero's own signal handler.
+
+    A closed bus is only one way this breaks. The other, seen in practice, is BlueZ answering
+    nothing at all: every property-changed signal then raises `NoReply` inside bluezero, which
+    dbus catches and logs, so the process stays up while serving nothing and writing the same
+    traceback for ever. Counting those and exiting lets run.sh restart the bridge, which does
+    recover it. One success resets the count, so a single slow reply is not fatal.
+    """
+    from bluezero import dbus_tools
+
+    original = dbus_tools.get_managed_objects
+    state = {"failures": 0}
+
+    def guarded(*args, **kwargs):
+        try:
+            result = original(*args, **kwargs)
+        except Exception as err:  # noqa: BLE001 - any D-Bus failure counts
+            state["failures"] += 1
+            if state["failures"] >= limit:
+                _LOG.error(
+                    "BlueZ has failed %d D-Bus calls in a row (%s); exiting so the bridge "
+                    "restarts", state["failures"], err,
+                )
+                os._exit(1)
+            raise
+        state["failures"] = 0
+        return result
+
+    dbus_tools.get_managed_objects = guarded
+
+
 def watch_dbus_connection() -> None:
     """Exit when the system bus goes away instead of spinning on a dead connection.
 
@@ -2379,6 +2411,7 @@ def main() -> None:
             f"{adapters}"
         )
     watch_dbus_connection()
+    guard_bluezero_dbus()
     dev = bz_adapter.Adapter(adapter_address)
     mac = dev.address
     _LOG.info(
