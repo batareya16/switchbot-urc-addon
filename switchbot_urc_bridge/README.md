@@ -28,9 +28,30 @@ provide. The add-on owns the second adapter, exposes service `cba20d00` with wri
 ## Requirements
 
 - A **second** Bluetooth adapter (USB dongle). One adapter stays with Home Assistant's Bluetooth
-  integration; this add-on owns the other (for example `hci1`) as a peripheral. Disable that
-  adapter in Home Assistant's Bluetooth adapter settings; setting `diagnostic_scan: false` only
-  disables this add-on's scanner, not another BlueZ client's scan.
+  integration; this add-on owns the other as a peripheral. Disable that adapter in Home
+  Assistant's Bluetooth adapter settings; setting `diagnostic_scan: false` only disables this
+  add-on's scanner, not another BlueZ client's scan.
+- Set `adapter` to the controller's **MAC address** rather than `hciN` where you can. Kernel
+  numbering is not stable — a reboot or a replug can swap hci0 and hci1, and the add-on then
+  silently owns the wrong radio.
+
+## Several native tiles on one adapter
+
+Each native tile connects to one fixed BLE address, so several tiles need several addresses.
+List them in `addresses` and the add-on serves all of them from one controller:
+
+```yaml
+adapter: "8A:88:1B:E0:1F:92"
+addresses: "8A:88:1B:E0:1F:92, DA:71:16:E0:1F:92"
+```
+
+The first address should be the controller's own, so tiles already bound to it keep working;
+every other must be a static random address, whose first octet is `C0` or higher.
+
+This needs a Bluetooth 5 controller, because it uses one extended advertising set per address —
+BlueZ cannot assign an address to an advertising instance, so the add-on takes the controller on
+the HCI user channel and serves ACL, L2CAP and ATT itself. Leaving `addresses` empty keeps the
+original BlueZ path, which serves one address and needs no Bluetooth 5.
 - The MQTT integration/broker.
 
 ## Install

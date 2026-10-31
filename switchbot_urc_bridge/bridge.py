@@ -25,6 +25,7 @@ import ctypes
 import json
 import logging
 import os
+import pathlib
 import select
 import signal
 import socket
@@ -39,6 +40,9 @@ import hci_multi
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _LOG = logging.getLogger("bridge")
+
+# run.sh treats this exit code as "do not restart, a person has to fix it".
+CONFIG_ERROR_EXIT = 78
 
 SVC = "cba20d00-224d-11e6-9fb8-0002a5d5c51b"
 CHAR_WRITE = "cba20002-224d-11e6-9fb8-0002a5d5c51b"
@@ -1549,6 +1553,17 @@ class SwitchBotDevice:
             if raw[1] != self._key_id:
                 _LOG.warning("encrypted frame uses unexpected keyId=%02x (expected %02x)",
                              raw[1], self._key_id)
+            # Bytes 2-3 name the session: they are the first two bytes of the IV the frame was
+            # encrypted with, which is also what our own acknowledgement echoes back. A frame
+            # from any other session decrypts to noise, and publishing that noise gives Home
+            # Assistant a button event that never happened. Dropping it is safe: the remote
+            # retries, and its retry begins with a fresh get-random.
+            if raw[2:4] != self._iv[:2]:
+                _LOG.warning(
+                    "ignoring a frame from another session: nonce=%s but this session's IV "
+                    "starts %s", raw[2:4].hex(), self._iv[:2].hex(),
+                )
+                return
             plain = aes_ctr(self._key, self._iv, raw[4:])
             ph = plain.hex()
             _LOG.info("decrypted command: %s", ph)
@@ -2011,16 +2026,34 @@ class Mqtt:
             self._publish_discovery()
 
     def set_control_handler(
-        self, handler, *, adapter_name: str, adapter_address: str
+        self, handler, *, adapter_name: str, adapter_address: str, capabilities=None
     ) -> None:  # noqa: ANN001
-        """Subscribe to integration requests that pause/resume peripheral mode."""
+        """Subscribe to integration requests that pause, resume, or re-address this bridge.
+
+        `capabilities` is republished with every status and identity message, because it is how
+        Remote Studio learns how many native tiles this controller can carry without anyone
+        having to read an add-on log.
+        """
         if self._client is None:
             return
 
         bridge_identity = {
             "adapter": adapter_name,
             "adapter_address": adapter_address.upper(),
+            **(dict(capabilities) if capabilities else {}),
         }
+        self._bridge_identity = bridge_identity
+
+        def _republish_identity() -> None:
+            """Refresh the retained identity after the bridge's capabilities change."""
+            if self._client is None:
+                return
+            self._client.publish(
+                "switchbot_urc/bridge/info",
+                json.dumps(self._bridge_identity), qos=1, retain=True,
+            )
+
+        self.republish_identity = _republish_identity
         manage_lock = threading.Lock()
         management_results: dict[str, dict] = {}
 
@@ -2102,9 +2135,9 @@ class Mqtt:
             ok = False
             error = ""
             try:
-                if action not in {"pause", "resume"}:
+                if action not in {"pause", "resume", "addresses"}:
                     raise ValueError(f"unsupported bridge action: {action}")
-                ok = bool(handler(action))
+                ok = bool(handler(action, payload))
             except Exception as err:  # noqa: BLE001 - report control failure over MQTT
                 error = str(err)
                 _LOG.exception("native bridge control %s failed", action or "request")
@@ -2365,6 +2398,32 @@ def run_multi_address(
     entirely, which is simpler and more complete than releasing the ATT CID as the BlueZ path
     has to: the integration then finds an ordinary adapter where it expects one.
     """
+    # Addresses added at run time have to survive a restart, or a tile bound to one stops
+    # working the next time the add-on starts. /data is the add-on's own persistent store.
+    store = pathlib.Path("/data/addresses.json")
+
+    def _remember_addresses(values: list[str]) -> None:
+        try:
+            store.parent.mkdir(parents=True, exist_ok=True)
+            store.write_text(json.dumps(values))
+        except OSError as err:
+            _LOG.warning("could not persist the served addresses: %s", err)
+
+    def _recall_addresses() -> list[str]:
+        try:
+            values = json.loads(store.read_text())
+        except (OSError, ValueError):
+            return []
+        return [str(item) for item in values if isinstance(item, str)] if isinstance(
+            values, list) else []
+
+    remembered = _recall_addresses()
+    extra = [item for item in remembered
+             if hci_multi.normalise(item) not in {hci_multi.normalise(a) for a in addresses}]
+    if extra:
+        _LOG.info("restoring %d address(es) added earlier: %s", len(extra), ", ".join(extra))
+        addresses = list(addresses) + extra
+
     server = hci_multi.MultiAddressServer(
         adapter,
         addresses,
@@ -2386,11 +2445,41 @@ def run_multi_address(
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
-    server.start()
+    try:
+        server.start()
+    except RuntimeError as err:  # noqa: F841 - reported below
+        # Wrong adapter, too few advertising sets, a controller already in use: all of these
+        # need a person, so say it once and stop instead of restarting into the same wall.
+        _LOG.error("multi-address bridge cannot start: %s", err)
+        raise SystemExit(CONFIG_ERROR_EXIT) from None
+    def _control(action: str, payload: dict | None = None) -> bool:
+        if action == "pause":
+            return server.pause()
+        if action == "resume":
+            return server.resume()
+        # "addresses": Remote Studio allocated a new address and needs this controller to serve
+        # it before the tile bound to it is ever pressed.
+        meant_for = str((payload or {}).get("adapter_address") or "")
+        if meant_for and hci_multi.normalise(meant_for) != hci_multi.normalise(
+            server.own_public
+        ):
+            # Every add-on instance subscribes to the same control topic, so a request naming
+            # another controller is not ours. Replacing our address list with its would stop
+            # answering every tile bound here.
+            _LOG.info("ignoring an addresses request meant for %s", meant_for)
+            return True
+        wanted = list((payload or {}).get("addresses") or [])
+        served = server.set_addresses(wanted)
+        _remember_addresses(served)
+        mq._bridge_identity.update(server.capabilities())
+        mq.republish_identity()
+        return True
+
     mq.set_control_handler(
-        lambda action: server.pause() if action == "pause" else server.resume(),
+        _control,
         adapter_name=adapter,
         adapter_address=server.own_public,
+        capabilities=server.capabilities(),
     )
     _LOG.info(
         "multi-address bridge running on %s for %s; bind each native tile's target MAC to one "
@@ -2594,7 +2683,7 @@ def main() -> None:
 
     bridge_state = {"paused": False}
 
-    def _bridge_control(action: str) -> bool:
+    def _bridge_control(action: str, _payload: dict | None = None) -> bool:
         if action == "pause":
             if bridge_state["paused"]:
                 # Idempotent: a retry/duplicate request while already paused is a no-op success.

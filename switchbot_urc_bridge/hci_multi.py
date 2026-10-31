@@ -22,6 +22,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import pathlib
 import select
 import socket
 import struct
@@ -59,6 +60,7 @@ EV_CMD_COMPLETE = 0x0E
 EV_CMD_STATUS = 0x0F
 EV_NUM_COMPLETED_PACKETS = 0x13
 EV_LE_META = 0x3E
+STATUS_UNKNOWN_COMMAND = 0x01
 LE_CONNECTION_COMPLETE = 0x01
 LE_ENHANCED_CONNECTION_COMPLETE = 0x0A
 LE_ADV_SET_TERMINATED = 0x12
@@ -140,6 +142,45 @@ def set_powered(index: int, powered: bool, timeout: float = 5.0) -> str:
         sock.close()
 
 
+def resolve_adapter(selector: str) -> tuple[str, int, str]:
+    """Resolve ``hciN`` or a controller MAC to ``(name, index, address)`` through sysfs.
+
+    Kernel adapter numbering is not stable: a reboot or a replug can swap hci0 and hci1, which
+    silently points the bridge at the wrong radio. Reading sysfs rather than asking BlueZ also
+    keeps this working when bluetoothd's D-Bus connection is wedged, which is a failure mode
+    this add-on has had to survive before.
+    """
+    wanted = selector.strip()
+    wanted_address = normalise(wanted) if ":" in wanted or len(wanted) == 12 else ""
+    root = pathlib.Path("/sys/class/bluetooth")
+    available: list[str] = []
+    for entry in sorted(root.glob("hci*")) if root.is_dir() else []:
+        try:
+            address = entry.joinpath("address").read_text().strip().upper()
+        except OSError:
+            continue
+        available.append(f"{entry.name}={address}")
+        index = int(entry.name.removeprefix("hci"))
+        if entry.name == wanted or (wanted_address and normalise(address) == wanted_address):
+            return entry.name, index, address
+    if not wanted_address and wanted.startswith("hci") and wanted[3:].isdigit():
+        # sysfs is unavailable but the selector is unambiguous; take it at face value.
+        return wanted, int(wanted[3:]), ""
+    raise RuntimeError(
+        f"Bluetooth adapter {selector!r} was not found; available: "
+        + (", ".join(available) or "none")
+    )
+
+
+class HciCommandError(OSError):
+    """A command the controller refused, keeping its status for callers that care."""
+
+    def __init__(self, opcode: int, status: int) -> None:
+        self.opcode = opcode
+        self.status = status
+        super().__init__(f"command 0x{opcode:04x} failed with status 0x{status:02x}")
+
+
 class UserChannel:
     """Exclusive raw HCI access to one controller."""
 
@@ -197,15 +238,13 @@ class UserChannel:
                     _count, returned = struct.unpack_from("<BH", params)
                     if returned == opcode:
                         if params[3]:
-                            raise OSError(
-                                f"command 0x{opcode:04x} failed with status 0x{params[3]:02x}")
+                            raise HciCommandError(opcode, params[3])
                         return params[4:]
                 elif code == EV_CMD_STATUS:
                     status, _count, returned = struct.unpack_from("<BBH", params)
                     if returned == opcode:
                         if status:
-                            raise OSError(
-                                f"command 0x{opcode:04x} failed with status 0x{status:02x}")
+                            raise HciCommandError(opcode, status)
                         return b""
         raise TimeoutError(f"command 0x{opcode:04x} got no answer")
 
@@ -296,8 +335,10 @@ class MultiAddressServer:
     ) -> None:
         if not addresses:
             raise ValueError("at least one address is required")
-        self.adapter = adapter
-        self.index = int(adapter.removeprefix("hci"))
+        self.adapter, self.index, self.expected_address = resolve_adapter(adapter)
+        if self.adapter != adapter.strip():
+            _LOG.info("adapter %r resolved to %s (%s)",
+                      adapter, self.adapter, self.expected_address or "address unknown")
         self.addresses = addresses
         self.protocol_factory = protocol_factory
         self.device_factory = device_factory
@@ -308,6 +349,8 @@ class MultiAddressServer:
         self.writer: AclWriter | None = None
         self.links: dict[int, Link] = {}
         self.own_public = ""
+        self.advertising_sets = 0
+        self.extended_advertising = False
         self._enable_frame = b""
         self._stop = threading.Event()
         self._paused = threading.Event()
@@ -326,24 +369,50 @@ class MultiAddressServer:
         channel.command(OP_LE_SET_EVENT_MASK, LE_EVENT_MASK)
         self.own_public = ":".join(
             f"{byte:02X}" for byte in reversed(channel.command(OP_READ_BD_ADDR)[:6]))
-        payload_size, credits = self._buffer_size(channel)
-        available = channel.command(OP_LE_READ_ADV_SETS)[0]
-        if len(self.addresses) > available:
+        _LOG.info("%s is the controller at %s", self.adapter, self.own_public)
+        if self.expected_address and normalise(self.expected_address) != normalise(self.own_public):
+            # sysfs and the controller disagree, so something renumbered under us mid-start.
             channel.close()
             set_powered(self.index, True)
             raise RuntimeError(
-                f"{self.adapter} offers {available} advertising sets but "
+                f"{self.adapter} reports {self.own_public} but was expected to be "
+                f"{self.expected_address}; set the adapter option to a MAC rather than hciN"
+            )
+        payload_size, credits = self._buffer_size(channel)
+
+        def _give_back() -> None:
+            channel.close()
+            set_powered(self.index, True)
+
+        try:
+            available = channel.command(OP_LE_READ_ADV_SETS)[0]
+        except HciCommandError as err:
+            _give_back()
+            if err.status == STATUS_UNKNOWN_COMMAND:
+                # Extended advertising is a Bluetooth 5 feature; a 4.x controller does not know
+                # the command at all. Adapter numbering is not stable across reboots, so the
+                # usual cause is that hciN now points at a different radio.
+                raise RuntimeError(
+                    f"{self.adapter} ({self.own_public}) does not support extended advertising, "
+                    "so it can only ever serve one address. Check that this is the Bluetooth 5 "
+                    "adapter — hci numbering changes across reboots and replugs — or leave the "
+                    "addresses option empty to keep the single-address BlueZ path."
+                ) from None
+            raise
+        if len(self.addresses) > available:
+            _give_back()
+            raise RuntimeError(
+                f"{self.adapter} ({self.own_public}) offers {available} advertising set(s) but "
                 f"{len(self.addresses)} addresses were configured"
             )
         self.channel = channel
+        self.advertising_sets = available
+        self.extended_advertising = True
         self.writer = AclWriter(channel, payload_size, credits)
         for handle, address in enumerate(self.addresses):
             self._configure_set(handle, address)
-        frame = bytes([0x01, len(self.addresses)])
-        for handle in range(len(self.addresses)):
-            frame += struct.pack("<BHB", handle, 0, 0)
-        self._enable_frame = frame
-        channel.command(OP_LE_SET_EXT_ADV_ENABLE, frame)
+        self._rebuild_enable_frame()
+        channel.command(OP_LE_SET_EXT_ADV_ENABLE, self._enable_frame)
         _LOG.info("%s claimed: public %s, ACL payload %d B, %d buffers, serving %s",
                   self.adapter, self.own_public, payload_size, credits,
                   ", ".join(self.addresses))
@@ -362,13 +431,20 @@ class MultiAddressServer:
 
     @staticmethod
     def _buffer_size(channel: UserChannel) -> tuple[int, int]:
-        payload = channel.command(OP_LE_READ_BUFFER_SIZE)
-        length, count = struct.unpack_from("<HB", payload)
-        if length and count:
-            return length, count
-        payload = channel.command(OP_READ_BUFFER_SIZE)
-        acl_length, _sco, acl_count, _sco_count = struct.unpack_from("<HBHH", payload)
-        return acl_length, acl_count
+        """LE buffers if the controller has its own, else the shared BR/EDR ones."""
+        try:
+            payload = channel.command(OP_LE_READ_BUFFER_SIZE)
+            length, count = struct.unpack_from("<HB", payload)
+            if length and count:
+                return length, count
+            payload = channel.command(OP_READ_BUFFER_SIZE)
+            acl_length, _sco, acl_count, _sco_count = struct.unpack_from("<HBHH", payload)
+            return acl_length, acl_count
+        except (HciCommandError, struct.error) as err:
+            # The spec's own minimum for LE is a 27-byte payload; assuming it costs throughput
+            # we do not need, and every ATT PDU here is small.
+            _LOG.warning("could not read the buffer size (%s); assuming 27 B and 4 buffers", err)
+            return 27, 4
 
     def _configure_set(self, handle: int, address: str) -> None:
         """One connectable legacy-PDU set.
@@ -397,6 +473,61 @@ class MultiAddressServer:
                 OP_LE_SET_ADV_SET_RANDOM_ADDR, bytes([handle]) + address_bytes(address))
         data = advertisement_for(address, self.conn_min, self.conn_max)
         self.channel.command(OP_LE_SET_EXT_ADV_DATA, bytes([handle, 0x03, 0x01, len(data)]) + data)
+
+    def capabilities(self) -> dict:
+        """What this controller can do, for the integration to plan against."""
+        return {
+            "controller": self.own_public,
+            "advertising_sets": self.advertising_sets,
+            "extended_advertising": self.extended_advertising,
+            "serving": list(self.addresses),
+            "multi_address": True,
+        }
+
+    def set_addresses(self, addresses: list[str]) -> list[str]:
+        """Serve a different set of addresses, without restarting the add-on.
+
+        The controller is reconfigured in place: an advertising set cannot change its address
+        while it is enabled, so this stops advertising, rewrites every set, and starts again.
+        Live connections are left alone — they are already past advertising.
+        """
+        wanted = [format_address(item) for item in addresses if item]
+        if not wanted:
+            raise ValueError("at least one address is required")
+        if len(wanted) > max(1, self.advertising_sets):
+            raise ValueError(
+                f"{self.adapter} has {self.advertising_sets} advertising set(s), "
+                f"so it cannot serve {len(wanted)} addresses"
+            )
+        if [normalise(item) for item in wanted] == [normalise(item) for item in self.addresses]:
+            return list(self.addresses)
+        if self.channel is None:
+            self.addresses = wanted
+            return wanted
+        self.channel.command(OP_LE_SET_EXT_ADV_ENABLE, bytes([0x00, 0x00]))
+        previous = self.addresses
+        self.addresses = wanted
+        try:
+            for handle, address in enumerate(wanted):
+                self._configure_set(handle, address)
+        except (OSError, TimeoutError):
+            # Put the working set back rather than leaving the bridge advertising nothing.
+            self.addresses = previous
+            for handle, address in enumerate(previous):
+                self._configure_set(handle, address)
+            self._rebuild_enable_frame()
+            self.channel.command(OP_LE_SET_EXT_ADV_ENABLE, self._enable_frame)
+            raise
+        self._rebuild_enable_frame()
+        self.channel.command(OP_LE_SET_EXT_ADV_ENABLE, self._enable_frame)
+        _LOG.info("%s now serving %s", self.adapter, ", ".join(wanted))
+        return wanted
+
+    def _rebuild_enable_frame(self) -> None:
+        frame = bytes([0x01, len(self.addresses)])
+        for handle in range(len(self.addresses)):
+            frame += struct.pack("<BHB", handle, 0, 0)
+        self._enable_frame = frame
 
     # -- lifecycle -----------------------------------------------------------------------
 
