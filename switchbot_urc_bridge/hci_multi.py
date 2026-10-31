@@ -77,6 +77,12 @@ def normalise(address: str) -> str:
     return address.replace(":", "").replace("-", "").upper()
 
 
+def format_address(address: str) -> str:
+    """The canonical colon-separated upper-case form, for logs and for the integration."""
+    compact = normalise(address)
+    return ":".join(compact[index:index + 2] for index in range(0, 12, 2))
+
+
 def address_bytes(address: str) -> bytes:
     raw = bytes.fromhex(normalise(address))
     if len(raw) != 6:
@@ -179,6 +185,100 @@ class HciCommandError(OSError):
         self.opcode = opcode
         self.status = status
         super().__init__(f"command 0x{opcode:04x} failed with status 0x{status:02x}")
+
+
+MGMT_OP_READ_ADV_FEATURES = 0x003D
+# Read Advertising Features flags saying the controller does extended advertising. Without
+# any of them it is a Bluetooth 4 radio and one address is all it will ever offer.
+ADV_FLAG_EXTENDED = 0x0080 | 0x0100 | 0x0200
+
+
+def probe_capabilities(index: int, timeout: float = 3.0) -> tuple[bool, int]:
+    """Ask the kernel what this controller can advertise, without taking it away from BlueZ.
+
+    Returns ``(does extended advertising, advertising sets)``. This is a plain read on the
+    management socket, so it is safe to call before deciding which path to run: claiming the
+    user channel powers the controller down, and doing that to find out it was pointless would
+    interrupt whatever BlueZ was doing with it.
+    """
+    af_bluetooth = getattr(socket, "AF_BLUETOOTH", 31)
+    btproto_hci = getattr(socket, "BTPROTO_HCI", 1)
+    sock_type = socket.SOCK_RAW | getattr(socket, "SOCK_CLOEXEC", 0)
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.socket(af_bluetooth, sock_type, btproto_hci)
+    if fd < 0:
+        return False, 1
+    address = struct.pack("=HHH", af_bluetooth, HCI_DEV_NONE, HCI_CHANNEL_CONTROL)
+    if libc.bind(fd, address, len(address)) < 0:
+        os.close(fd)
+        return False, 1
+    sock = socket.socket(af_bluetooth, sock_type, btproto_hci, fileno=fd)
+    try:
+        sock.settimeout(timeout)
+        sock.send(struct.pack("<HHH", MGMT_OP_READ_ADV_FEATURES, index, 0))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            event = sock.recv(1024)
+            if len(event) < 9:
+                continue
+            code, event_index, length = struct.unpack_from("<HHH", event)
+            body = event[6:6 + length]
+            if event_index != index or code not in (MGMT_EV_CMD_COMPLETE, MGMT_EV_CMD_STATUS):
+                continue
+            command, status = struct.unpack_from("<HB", body)
+            if command != MGMT_OP_READ_ADV_FEATURES:
+                continue
+            if status or len(body) < 3 + 7:
+                return False, 1
+            flags, _max_adv, _max_scan, sets = struct.unpack_from("<IBBB", body, 3)
+            return bool(flags & ADV_FLAG_EXTENDED), max(1, sets)
+        return False, 1
+    except OSError:
+        return False, 1
+    finally:
+        sock.close()
+
+
+def plan_mode(
+    extended: bool,
+    sets: int,
+    own_address: str,
+    configured: list[str],
+    remembered: list[str],
+) -> tuple[bool, list[str], str]:
+    """Decide which path to run and which addresses to serve.
+
+    Kept free of sockets so the decision can be tested on its own. Returns
+    ``(serve several addresses, the list, why)``. The controller's own address always comes
+    first: every tile bound before any of this existed points at it.
+    """
+    wanted: list[str] = []
+    for item in [own_address, *configured, *remembered]:
+        if not item or not is_address(item):
+            continue
+        if not any(normalise(item) == normalise(seen) for seen in wanted):
+            wanted.append(format_address(normalise(item)))
+    if not wanted:
+        return False, [], "no usable address is known for this controller"
+    if not extended:
+        if len(configured) > 1:
+            return False, wanted[:1], (
+                f"{len(configured)} addresses are configured, but this controller does not do "
+                "extended advertising and can only ever serve one"
+            )
+        return False, wanted[:1], "this controller does not do extended advertising"
+    if len(wanted) > sets:
+        kept, dropped = wanted[:sets], wanted[sets:]
+        return True, kept, (
+            f"this controller has {sets} advertising set(s), so {', '.join(dropped)} "
+            "cannot be served"
+        )
+    return True, wanted, f"extended advertising with {sets} set(s)"
+
+
+def is_address(value: str) -> bool:
+    compact = normalise(value)
+    return len(compact) == 12 and all(char in "0123456789ABCDEF" for char in compact)
 
 
 class UserChannel:
@@ -416,6 +516,14 @@ class MultiAddressServer:
         _LOG.info("%s claimed: public %s, ACL payload %d B, %d buffers, serving %s",
                   self.adapter, self.own_public, payload_size, credits,
                   ", ".join(self.addresses))
+        if not any(normalise(item) == normalise(self.own_public) for item in self.addresses):
+            # Legitimate, but it is the quiet way to break every tile bound before this option
+            # existed, because they all point at the controller's own address.
+            _LOG.warning(
+                "%s is not in the addresses list, so any tile bound to the controller's own "
+                "address is no longer answered; add it if presses stopped working",
+                self.own_public,
+            )
 
     def _release(self) -> None:
         if self.channel is not None:

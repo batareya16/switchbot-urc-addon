@@ -38,20 +38,24 @@ provide. The add-on owns the second adapter, exposes service `cba20d00` with wri
 ## Several native tiles on one adapter
 
 Each native tile connects to one fixed BLE address, so several tiles need several addresses.
-List them in `addresses` and the add-on serves all of them from one controller:
+**There is nothing to configure.** Whether a controller can carry several addresses is a
+property of the radio, so the add-on asks the kernel at startup and decides for itself:
 
-```yaml
-adapter: "8A:88:1B:E0:1F:92"
-addresses: "8A:88:1B:E0:1F:92, DA:71:16:E0:1F:92"
-```
+- A **Bluetooth 5** controller is taken on the HCI user channel and serves one advertising set
+  per address, starting with its own. Remote Studio allocates each further address, tells the
+  add-on to serve it, and the add-on keeps it in `/data` across restarts.
+- A **Bluetooth 4** controller keeps the original BlueZ path and its single address, exactly as
+  before. So does a Bluetooth 5 one that cannot be claimed, for instance because something else
+  still holds it. The log line says which path was taken and why.
 
-The first address should be the controller's own, so tiles already bound to it keep working;
-every other must be a static random address, whose first octet is `C0` or higher.
+The only setting that matters is **`adapter`, which should be a MAC rather than `hciN`**: kernel
+numbering is not stable across reboots and replugs, and the add-on would otherwise claim
+whichever radio happens to be at that number.
 
-This needs a Bluetooth 5 controller, because it uses one extended advertising set per address —
-BlueZ cannot assign an address to an advertising instance, so the add-on takes the controller on
-the HCI user channel and serves ACL, L2CAP and ATT itself. Leaving `addresses` empty keeps the
-original BlueZ path, which serves one address and needs no Bluetooth 5.
+`addresses` is still there, but only to pin a specific list — a second controller you want to
+reserve, or an address chosen by hand. It is never required, and the controller's own address is
+always served whether it is listed or not. Any address added by hand must be a static random
+address, first octet `C0` or higher.
 - The MQTT integration/broker.
 
 ## Install

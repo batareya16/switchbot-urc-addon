@@ -41,9 +41,6 @@ import hci_multi
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _LOG = logging.getLogger("bridge")
 
-# run.sh treats this exit code as "do not restart, a person has to fix it".
-CONFIG_ERROR_EXIT = 78
-
 SVC = "cba20d00-224d-11e6-9fb8-0002a5d5c51b"
 CHAR_WRITE = "cba20002-224d-11e6-9fb8-0002a5d5c51b"
 CHAR_NOTIFY = "cba20003-224d-11e6-9fb8-0002a5d5c51b"
@@ -2384,48 +2381,61 @@ class Mqtt:
         )
 
 
+# Addresses added at run time have to survive a restart, or a tile bound to one stops working
+# the next time the add-on starts. /data is the add-on's own persistent store.
+_ADDRESS_STORE = pathlib.Path("/data/addresses.json")
+
+
+def _remember_addresses(values: list[str]) -> None:
+    try:
+        _ADDRESS_STORE.parent.mkdir(parents=True, exist_ok=True)
+        _ADDRESS_STORE.write_text(json.dumps(values))
+    except OSError as err:
+        _LOG.warning("could not persist the served addresses: %s", err)
+
+
+def _recall_addresses() -> list[str]:
+    try:
+        values = json.loads(_ADDRESS_STORE.read_text())
+    except (OSError, ValueError):
+        return []
+    return [str(item) for item in values if isinstance(item, str)] if isinstance(
+        values, list) else []
+
+
 def run_multi_address(
     adapter: str,
-    addresses: list[str],
+    configured: list[str],
     key: bytes,
     mq: "Mqtt",
     remote_address: str,
-) -> None:
-    """Serve several native addresses from one controller, instead of BlueZ serving one.
+) -> bool:
+    """Serve several native addresses from one controller, if this controller can.
+
+    Returns whether it took over. `False` means the caller should run the BlueZ path: either
+    the controller does not do extended advertising, or claiming it failed. Falling back rather
+    than exiting matters now that this is chosen automatically — a Bluetooth 4 adapter has to
+    keep working exactly as it did, not leave someone with a dead add-on.
 
     This path takes the controller on the HCI user channel, so BlueZ is detached from it and
     bluezero is not used at all. Pausing for a management session hands the controller back
     entirely, which is simpler and more complete than releasing the ATT CID as the BlueZ path
     has to: the integration then finds an ordinary adapter where it expects one.
     """
-    # Addresses added at run time have to survive a restart, or a tile bound to one stops
-    # working the next time the add-on starts. /data is the add-on's own persistent store.
-    store = pathlib.Path("/data/addresses.json")
-
-    def _remember_addresses(values: list[str]) -> None:
-        try:
-            store.parent.mkdir(parents=True, exist_ok=True)
-            store.write_text(json.dumps(values))
-        except OSError as err:
-            _LOG.warning("could not persist the served addresses: %s", err)
-
-    def _recall_addresses() -> list[str]:
-        try:
-            values = json.loads(store.read_text())
-        except (OSError, ValueError):
-            return []
-        return [str(item) for item in values if isinstance(item, str)] if isinstance(
-            values, list) else []
-
-    remembered = _recall_addresses()
-    extra = [item for item in remembered
-             if hci_multi.normalise(item) not in {hci_multi.normalise(a) for a in addresses}]
-    if extra:
-        _LOG.info("restoring %d address(es) added earlier: %s", len(extra), ", ".join(extra))
-        addresses = list(addresses) + extra
+    try:
+        name, index, own = hci_multi.resolve_adapter(adapter)
+    except RuntimeError as err:
+        _LOG.warning("%s; serving a single address instead", err)
+        return False
+    extended, sets = hci_multi.probe_capabilities(index)
+    multi, addresses, why = hci_multi.plan_mode(
+        extended, sets, own, configured, _recall_addresses())
+    _LOG.info("%s (%s): %s", name, own or "address unknown", why)
+    if not multi:
+        return False
 
     server = hci_multi.MultiAddressServer(
-        adapter,
+        name,
         addresses,
         protocol_factory=FastAttProtocol,
         device_factory=lambda notify, address_of: SwitchBotDevice(
@@ -2447,11 +2457,12 @@ def run_multi_address(
     signal.signal(signal.SIGINT, _shutdown)
     try:
         server.start()
-    except RuntimeError as err:  # noqa: F841 - reported below
-        # Wrong adapter, too few advertising sets, a controller already in use: all of these
-        # need a person, so say it once and stop instead of restarting into the same wall.
-        _LOG.error("multi-address bridge cannot start: %s", err)
-        raise SystemExit(CONFIG_ERROR_EXIT) from None
+    except (RuntimeError, OSError) as err:
+        # The controller said it could do this and then would not be claimed — most often
+        # because something else still holds it. One address through BlueZ is a working
+        # add-on; exiting here would be a dead one.
+        _LOG.warning("could not claim %s for several addresses (%s)", name, err)
+        return False
     def _control(action: str, payload: dict | None = None) -> bool:
         if action == "pause":
             return server.pause()
@@ -2487,6 +2498,8 @@ def run_multi_address(
         adapter,
         ", ".join(addresses),
     )
+    # From here this call owns the process; it only ever returns False, above, when it
+    # declined to take the controller.
     while True:
         time.sleep(3600)
 
@@ -2537,13 +2550,15 @@ def main() -> None:
     mq = Mqtt(topic, discovery, remote_address)
 
     # Several native tiles need several BLE addresses, which BlueZ cannot provide: see
-    # hci_multi.py. Configuring more than one address switches to the raw-HCI server; leaving
-    # ADDRESSES empty keeps the long-proven BlueZ path exactly as it was.
-    addresses = [item.strip() for item in os.environ.get("ADDRESSES", "").split(",")
-                 if item.strip()]
-    if addresses:
-        run_multi_address(adapter, addresses, key, mq, remote_address)
+    # hci_multi.py. Whether that is possible is a property of the controller, not something
+    # anyone should have to know and configure, so it is detected. ADDRESSES remains only as a
+    # way to pin a specific list; it is not what turns the feature on. This call returns only
+    # when it declines the controller, and then the original BlueZ path runs below.
+    configured = [item.strip() for item in os.environ.get("ADDRESSES", "").split(",")
+                  if item.strip()]
+    if run_multi_address(adapter, configured, key, mq, remote_address) is not False:
         return
+    _LOG.info("serving one address through BlueZ")
 
     import dbus
     import dbus.service
@@ -2684,6 +2699,15 @@ def main() -> None:
     bridge_state = {"paused": False}
 
     def _bridge_control(action: str, _payload: dict | None = None) -> bool:
+        if action == "addresses":
+            # This path serves exactly one address, the controller's own. Everything after the
+            # pause branch is the resume branch, so without this an addresses request would be
+            # answered with a cheerful success and Remote Studio would believe a tile it just
+            # bound is being advertised when nothing is.
+            raise RuntimeError(
+                "this bridge serves a single address; set the add-on's `addresses` option to "
+                "use several, which needs a Bluetooth 5 controller"
+            )
         if action == "pause":
             if bridge_state["paused"]:
                 # Idempotent: a retry/duplicate request while already paused is a no-op success.

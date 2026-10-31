@@ -89,10 +89,6 @@ while true; do
     bashio::log.info "bridge exited normally"
     break
   fi
-  if [ "${status}" -eq 78 ]; then
-    bashio::log.error "bridge stopped on a configuration problem; fix it and restart the add-on"
-    break
-  fi
   bashio::log.warning "bridge exited with status ${status}; restarting in 5s"
   sleep 5
 done
