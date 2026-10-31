@@ -1496,6 +1496,10 @@ class SwitchBotDevice:
         self._notify = notify          # callable(bytes) -> notify on cba20003
         self._on_button = on_button     # callable(label, plain_hex, remote_id, remote_slot)
         self._iv: bytes | None = None
+        # The remote asks for several randoms in a row and then sends a frame for each, so the
+        # newest IV is not always the one a frame was encrypted with. Keep the recent ones,
+        # keyed by the two bytes every frame carries to name its session.
+        self._sessions: dict[bytes, bytes] = {}
         self._key_id = 0x95
         self._last_command: bytes | None = None
         self._last_command_at = 0.0
@@ -1542,6 +1546,10 @@ class SwitchBotDevice:
                 and raw[5:7] == b"\x21\x03"):
             self._key_id = raw[7] if len(raw) > 7 else 0x95
             self._iv = os.urandom(16)
+            self._sessions[self._iv[:2]] = self._iv
+            # Bounded: a remote that keeps asking must not grow this without end.
+            while len(self._sessions) > 16:
+                self._sessions.pop(next(iter(self._sessions)))
             _LOG.info("handshake get-random -> IV=%s", self._iv.hex())
             self._notify(bytes([0x01, 0x00, 0x00, 0x00]) + self._iv)
             return
@@ -1551,17 +1559,20 @@ class SwitchBotDevice:
                 _LOG.warning("encrypted frame uses unexpected keyId=%02x (expected %02x)",
                              raw[1], self._key_id)
             # Bytes 2-3 name the session: they are the first two bytes of the IV the frame was
-            # encrypted with, which is also what our own acknowledgement echoes back. A frame
-            # from any other session decrypts to noise, and publishing that noise gives Home
-            # Assistant a button event that never happened. Dropping it is safe: the remote
-            # retries, and its retry begins with a fresh get-random.
-            if raw[2:4] != self._iv[:2]:
+            # encrypted with. Look it up rather than assuming the newest one — the remote
+            # pipelines several get-randoms and then sends a frame for each, so the match is
+            # often an earlier IV. A frame naming a session we never issued would decrypt to
+            # noise and reach Home Assistant as a button press that never happened.
+            iv = self._sessions.get(bytes(raw[2:4]))
+            if iv is None:
                 _LOG.warning(
-                    "ignoring a frame from another session: nonce=%s but this session's IV "
-                    "starts %s", raw[2:4].hex(), self._iv[:2].hex(),
+                    "ignoring a frame naming session %s, which this connection never issued "
+                    "(known: %s)",
+                    raw[2:4].hex(),
+                    ", ".join(key.hex() for key in self._sessions) or "none",
                 )
                 return
-            plain = aes_ctr(self._key, self._iv, raw[4:])
+            plain = aes_ctr(self._key, iv, raw[4:])
             ph = plain.hex()
             _LOG.info("decrypted command: %s", ph)
             # The remote relays the stored key command with its leading 0x57 magic consumed as the
@@ -1577,13 +1588,24 @@ class SwitchBotDevice:
                 str(metadata.get("device_type", "")),
             )
             remote_id, remote_slot = decode_event_source(full)
+            if remote_id is None:
+                # A frame that does not parse as a bridge event did not decrypt: the session
+                # was matched by two bytes, which can collide. Whatever this is, it is not a
+                # press, and publishing it would fire an automation on noise.
+                _LOG.warning(
+                    "ignoring a frame that did not decrypt into a press (session %s): %s",
+                    raw[2:4].hex(), ph,
+                )
+                return
             _LOG.info(
                 ">>> BUTTON: %s remote_id=%s slot=%s", label, remote_id, remote_slot
             )
             # ACK before MQTT: first-use discovery can take about 100 ms, long enough for WoRWS
             # to retransmit the command.
-            ack = aes_ctr(self._key, self._iv, bytes([0x01]))
-            self._notify(bytes([0x01, self._key_id, self._iv[0], self._iv[1]]) + ack)
+            # Acknowledged in the frame's own session, not the newest one, or the remote
+            # cannot match the answer to the command it sent.
+            ack = aes_ctr(self._key, iv, bytes([0x01]))
+            self._notify(bytes([0x01, self._key_id, iv[0], iv[1]]) + ack)
             # Publish unknown commands too: the first live press is protocol evidence and must
             # not disappear merely because the local map does not know it yet.
             if self._is_immediate_retry(full):
