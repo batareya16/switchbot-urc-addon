@@ -3,6 +3,9 @@
 set -e
 
 ADAPTER="$(bashio::config 'adapter')"
+ADDRESSES="$(bashio::config 'addresses')"
+# bashio renders an unset optional as the string "null"; the bridge wants it empty.
+if [ "${ADDRESSES}" = "null" ]; then ADDRESSES=""; fi
 REMOTE_ADDRESS="$(bashio::config 'remote_address')"
 NAME="$(bashio::config 'name')"
 TOPIC="$(bashio::config 'mqtt_topic')"
@@ -69,7 +72,7 @@ else
   bashio::log.warning "No MQTT service — button events will only be logged."
 fi
 
-export ADAPTER REMOTE_ADDRESS NAME TOPIC DISCOVERY DIAGNOSTIC_SCAN HCI_TRACE \
+export ADAPTER ADDRESSES REMOTE_ADDRESS NAME TOPIC DISCOVERY DIAGNOSTIC_SCAN HCI_TRACE \
   PREWARM_REMOTE_CACHE DEVICE_KEY
 export DIRECT_ATT RAW_ATT_IDLE_TIMEOUT RAW_ATT_KEEPALIVE_INTERVAL \
   RAW_ATT_KEEPALIVE_WINDOW CONN_INTERVAL_MIN_MS CONN_INTERVAL_MAX_MS

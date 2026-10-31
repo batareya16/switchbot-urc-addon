@@ -21,6 +21,7 @@ RUN apk add --no-cache \
 
 COPY run.sh /run.sh
 COPY bridge.py /bridge.py
+COPY hci_multi.py /hci_multi.py
 RUN chmod a+x /run.sh
 
 CMD [ "/run.sh" ]

@@ -35,6 +35,8 @@ import time
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+import hci_multi
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _LOG = logging.getLogger("bridge")
 
@@ -2349,6 +2351,57 @@ class Mqtt:
         )
 
 
+def run_multi_address(
+    adapter: str,
+    addresses: list[str],
+    key: bytes,
+    mq: "Mqtt",
+    remote_address: str,
+) -> None:
+    """Serve several native addresses from one controller, instead of BlueZ serving one.
+
+    This path takes the controller on the HCI user channel, so BlueZ is detached from it and
+    bluezero is not used at all. Pausing for a management session hands the controller back
+    entirely, which is simpler and more complete than releasing the ATT CID as the BlueZ path
+    has to: the integration then finds an ordinary adapter where it expects one.
+    """
+    server = hci_multi.MultiAddressServer(
+        adapter,
+        addresses,
+        protocol_factory=FastAttProtocol,
+        device_factory=lambda notify, address_of: SwitchBotDevice(
+            key,
+            notify,
+            lambda label, ph, remote_id, remote_slot: mq.publish(
+                label, ph, remote_id=remote_id, remote_slot=remote_slot
+            ),
+        ),
+        conn_min=WORWS_CONN_MIN,
+        conn_max=WORWS_CONN_MAX,
+    )
+
+    def _shutdown(*_args) -> None:
+        server.stop()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    server.start()
+    mq.set_control_handler(
+        lambda action: server.pause() if action == "pause" else server.resume(),
+        adapter_name=adapter,
+        adapter_address=server.own_public,
+    )
+    _LOG.info(
+        "multi-address bridge running on %s for %s; bind each native tile's target MAC to one "
+        "of these addresses",
+        adapter,
+        ", ".join(addresses),
+    )
+    while True:
+        time.sleep(3600)
+
+
 def main() -> None:
     adapter = os.environ.get("ADAPTER", "hci1")
     remote_address = os.environ.get("REMOTE_ADDRESS", "").strip()
@@ -2393,6 +2446,15 @@ def main() -> None:
         raise SystemExit("DEVICE_KEY must be exactly 32 hexadecimal characters")
 
     mq = Mqtt(topic, discovery, remote_address)
+
+    # Several native tiles need several BLE addresses, which BlueZ cannot provide: see
+    # hci_multi.py. Configuring more than one address switches to the raw-HCI server; leaving
+    # ADDRESSES empty keeps the long-proven BlueZ path exactly as it was.
+    addresses = [item.strip() for item in os.environ.get("ADDRESSES", "").split(",")
+                 if item.strip()]
+    if addresses:
+        run_multi_address(adapter, addresses, key, mq, remote_address)
+        return
 
     import dbus
     import dbus.service

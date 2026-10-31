@@ -1,5 +1,5 @@
 name: SwitchBot URC Bridge
-version: "0.22.1"
+version: "0.23.0"
 slug: switchbot_urc_bridge
 description: >-
   Fake native SwitchBot target for receiving encrypted button commands directly from WoRWS.
@@ -27,6 +27,7 @@ services:
   - mqtt:want
 options:
   adapter: hci1
+  addresses: ""
   remote_address: ""
   name: HASS Light
   mqtt_topic: switchbot_urc/button
@@ -43,6 +44,7 @@ options:
   device_key: "00112233445566778899aabbccddeeff"
 schema:
   adapter: str
+  addresses: str?
   remote_address: str
   name: str
   mqtt_topic: str
