@@ -1512,6 +1512,30 @@ class SwitchBotDevice:
         self._last_command_at = now
         return repeated
 
+    def _decrypt_command(self, raw: bytes) -> tuple[bytes | None, bytes]:
+        """Find the session a command frame belongs to, and decrypt it.
+
+        Bytes 2-3 name the session, and normally that is the answer. They are only two bytes
+        though, and the remote has been seen sending frames naming a session this connection
+        never issued, so the label is a hint rather than proof: every remembered session is
+        tried and the one whose plaintext reads as a bridge event wins. A frame that no session
+        turns into an event is not a press, and publishing it would fire automations on noise.
+        """
+        named = self._sessions.get(bytes(raw[2:4]))
+        candidates = [named] if named else []
+        candidates += [iv for iv in self._sessions.values() if iv is not named]
+        for candidate in candidates:
+            plain = aes_ctr(self._key, candidate, raw[4:])
+            remote_id, _slot = decode_event_source(b"\x57" + plain)
+            if remote_id is not None:
+                if candidate is not named:
+                    _LOG.info(
+                        "frame named session %s but decrypts under %s; using that one",
+                        raw[2:4].hex(), candidate[:2].hex(),
+                    )
+                return candidate, plain
+        return None, b""
+
     def on_write(self, raw: bytes) -> None:
         _LOG.info("REMOTE wrote: %s", raw.hex())
         # Native device pages carry their target's command verbatim. Unlike phone -> WoRWS control
@@ -1563,16 +1587,16 @@ class SwitchBotDevice:
             # pipelines several get-randoms and then sends a frame for each, so the match is
             # often an earlier IV. A frame naming a session we never issued would decrypt to
             # noise and reach Home Assistant as a button press that never happened.
-            iv = self._sessions.get(bytes(raw[2:4]))
+            iv, plain = self._decrypt_command(raw)
             if iv is None:
-                _LOG.warning(
-                    "ignoring a frame naming session %s, which this connection never issued "
-                    "(known: %s)",
+                _LOG.info(
+                    "ignoring a frame naming session %s: no session this connection issued "
+                    "decrypts it into a press (known: %s). The remote flushing something it "
+                    "queued on an earlier connection looks exactly like this.",
                     raw[2:4].hex(),
                     ", ".join(key.hex() for key in self._sessions) or "none",
                 )
                 return
-            plain = aes_ctr(self._key, iv, raw[4:])
             ph = plain.hex()
             _LOG.info("decrypted command: %s", ph)
             # The remote relays the stored key command with its leading 0x57 magic consumed as the
@@ -1587,16 +1611,8 @@ class SwitchBotDevice:
                 int(key_fun) if key_fun is not None else None,
                 str(metadata.get("device_type", "")),
             )
+            # Guaranteed to parse: `_decrypt_command` only returns a plaintext that does.
             remote_id, remote_slot = decode_event_source(full)
-            if remote_id is None:
-                # A frame that does not parse as a bridge event did not decrypt: the session
-                # was matched by two bytes, which can collide. Whatever this is, it is not a
-                # press, and publishing it would fire an automation on noise.
-                _LOG.warning(
-                    "ignoring a frame that did not decrypt into a press (session %s): %s",
-                    raw[2:4].hex(), ph,
-                )
-                return
             _LOG.info(
                 ">>> BUTTON: %s remote_id=%s slot=%s", label, remote_id, remote_slot
             )
