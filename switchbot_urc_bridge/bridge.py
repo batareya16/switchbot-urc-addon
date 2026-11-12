@@ -40,6 +40,7 @@ import hci_multi
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _LOG = logging.getLogger("bridge")
+BRIDGE_VERSION = "0.31.0"
 
 SVC = "cba20d00-224d-11e6-9fb8-0002a5d5c51b"
 CHAR_WRITE = "cba20002-224d-11e6-9fb8-0002a5d5c51b"
@@ -2061,7 +2062,8 @@ class Mqtt:
             self._publish_discovery()
 
     def set_control_handler(
-        self, handler, *, adapter_name: str, adapter_address: str, capabilities=None
+        self, handler, *, adapter_name: str, adapter_address: str, capabilities=None,
+        management_runner=None,
     ) -> None:  # noqa: ANN001
         """Subscribe to integration requests that pause, resume, or re-address this bridge.
 
@@ -2093,7 +2095,7 @@ class Mqtt:
         management_results: dict[str, dict] = {}
 
         def _run_management(client, payload: dict) -> None:  # noqa: ANN001
-            """Pause the peripheral, run the WoRWS management session, resume, report result."""
+            """Execute a serialized transaction on the selected bridge transport."""
             request_id = str(payload.get("request_id", ""))
             result: dict = {"ok": False, "failed_stage": "bridge", "error": "not started"}
             paused = False
@@ -2109,17 +2111,30 @@ class Mqtt:
                     )
                     return
                 try:
-                    paused = bool(handler("pause"))
-                    if not paused:
-                        raise RuntimeError("could not pause peripheral before management")
-                    time.sleep(0.5)
-                    result = run_remote_management(
-                        adapter_name,
-                        str(payload["address"]),
-                        str(payload["key"]),
-                        int(payload["key_id"]),
-                        list(payload.get("steps", [])),
-                    )
+                    steps = list(payload.get("steps", []))
+                    if management_runner is not None:
+                        try:
+                            result = management_runner(str(payload["address"]), str(payload["key"]),
+                                                       int(payload["key_id"]), steps)
+                            if not isinstance(result, dict) or "ok" not in result:
+                                raise RuntimeError("raw HCI management returned an invalid result")
+                            result.setdefault("transport", "raw_hci")
+                        except Exception as err:  # noqa: BLE001 - report without changing transport
+                            result = {"ok": False, "failed_stage": "bridge", "error": str(err),
+                                      "transport": "raw_hci"}
+                            _LOG.exception("raw HCI management failed; bridge remains on raw HCI")
+                    else:
+                        paused = bool(handler("pause"))
+                        if not paused:
+                            raise RuntimeError("could not pause peripheral before management")
+                        time.sleep(0.5)
+                        result = run_remote_management(
+                            adapter_name,
+                            str(payload["address"]),
+                            str(payload["key"]),
+                            int(payload["key_id"]),
+                            steps,
+                        )
                     if result.get("ok"):
                         _LOG.info(
                             "remote management ok: iv=%s responses=%s",
@@ -2226,7 +2241,7 @@ class Mqtt:
             "name": "SwitchBot URC Bridge",
             "manufacturer": "SwitchBot",
             "model": "WoRWS native bridge",
-            "sw_version": "0.19.32",
+            "sw_version": BRIDGE_VERSION,
         }
         payload = {
             "name": "SwitchBot URC Button",
@@ -2287,7 +2302,7 @@ class Mqtt:
             "name": f"SwitchBot URC Remote {remote_id.upper()}",
             "manufacturer": "SwitchBot",
             "model": "WoRWS logical native remote",
-            "sw_version": "0.19.32",
+            "sw_version": BRIDGE_VERSION,
             "via_device": "switchbot_urc_bridge",
         }
         event_payload = {
@@ -2362,7 +2377,7 @@ class Mqtt:
                 "name": f"SwitchBot URC Remote {remote_id.upper()}",
                 "manufacturer": "SwitchBot",
                 "model": "WoRWS logical native remote",
-                "sw_version": "0.19.32",
+                "sw_version": BRIDGE_VERSION,
                 "via_device": "switchbot_urc_bridge",
             },
         }
@@ -2455,10 +2470,9 @@ def run_multi_address(
     than exiting matters now that this is chosen automatically — a Bluetooth 4 adapter has to
     keep working exactly as it did, not leave someone with a dead add-on.
 
-    This path takes the controller on the HCI user channel, so BlueZ is detached from it and
-    bluezero is not used at all. Pausing for a management session hands the controller back
-    entirely, which is simpler and more complete than releasing the ATT CID as the BlueZ path
-    has to: the integration then finds an ordinary adapter where it expects one.
+    This path takes the controller on the HCI user channel. Its central ATT client executes all
+    management on that same channel, while peripheral links stay in the event loop. Management
+    does not pause this bridge or hand the controller to BlueZ.
     """
     try:
         name, index, own = hci_multi.resolve_adapter(adapter)
@@ -2529,6 +2543,8 @@ def run_multi_address(
         adapter_name=adapter,
         adapter_address=server.own_public,
         capabilities=server.capabilities(),
+        management_runner=lambda address, key_hex, key_id, steps: server.manage_remote(
+            address, key_hex, key_id, steps, crypt=aes_ctr),
     )
     _LOG.info(
         "multi-address bridge running on %s for %s; bind each native tile's target MAC to one "

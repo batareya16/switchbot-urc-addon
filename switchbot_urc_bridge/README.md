@@ -4,6 +4,31 @@ Fake native SwitchBot target for WoRWS. Companion to the
 [SwitchBot Universal Remote integration](https://github.com/batareya16/SwitchbotURCHass),
 whose `PROTOCOL.md` documents the protocol this add-on speaks.
 
+### 0.31.0 — all multi-address management through raw HCI
+
+HCI commands now preserve interleaved connection events and button packets. ACL replies queue
+until controller buffers are available, with credits tracked per connection and reclaimed on
+disconnect. Controller ownership changes are serialized with packet processing. Connections
+are matched to their advertising address by handle, and adding a target leaves unchanged
+connected advertising sets configured as they were. Failed startup returns the adapter to
+BlueZ. These fixes have regression tests; radio behaviour still needs validation on hardware.
+
+The multi-address bridge executes the entire management transaction through its own HCI/ATT
+client: inventory/storage/scene reads, session handshake, target keys, binding pages, deleting,
+renaming and other encrypted commands sent by the integration. It discovers fresh handles,
+negotiates MTU, subscribes to notifications and chunks large frames to fit that MTU. Read-only
+transactions skip the handshake; mixed transactions share one secure session. The adapter is
+not handed to BlueZ and there is no automatic transport fallback.
+
+Success logs `raw HCI management complete; bridge stayed active`. Failures report the failing
+stage and completed responses to Home Assistant. Device rejection stops transactions that
+specify accepted response codes. The bridge never automatically repeats a command after a lost
+acknowledgement. Protocol errors do not count as physical disconnects: a new management
+connection waits for confirmed cleanup of the old one.
+
+This path has scripted ATT/HCI and crypto tests; it still requires hardware validation. The
+single-address path for older controllers continues to use BlueZ.
+
 Firmware analysis confirms that a native button press makes
 the remote connect directly to the MAC saved by `0F 20 08`, discover the standard SwitchBot GATT
 profile, perform the `0F 21 03` session handshake, and write the encrypted device command.
@@ -179,6 +204,14 @@ The add-on now detects that and exits, and `run.sh` restarts it after five secon
 what actually recovers the service; staying up on a dead bus does not.
 
 ### Management sessions
+
+On the multi-address path, management uses raw HCI/ATT exclusively. Errors include
+`failed_stage`, `stage_detail`, completed responses and whether a command may already have
+been written. A post-write timeout is not retried by the bridge. Bind/delete still require
+the normal inventory verification in the integration; an ACK alone does not prove that the
+expected table change occurred.
+
+The following BlueZ diagnostics apply to the older single-address path:
 
 Two failure modes were seen repeatedly during a long device session and are now handled.
 
