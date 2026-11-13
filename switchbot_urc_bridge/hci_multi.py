@@ -1228,13 +1228,17 @@ class MultiAddressServer:
                     self._central_client = None
                 self._central_link = None
             link = self.links.pop(handle, None)
-            self._pending_set_addresses.pop(handle, None)
+            pending_address = self._pending_set_addresses.pop(handle, None)
             if self.writer is not None:
                 self.writer.disconnected(handle)
             if link is not None:
                 _LOG.info("disconnected handle=%d reason=0x%02x address=%s summary=%s",
                           handle, params[3], link.address, link.protocol.session_summary())
-            self._rearm()
+            # Only an incoming connection consumes one of our advertising sets. An outgoing
+            # central management connection leaves those sets enabled, so re-enabling them here
+            # sends an invalid 0x2039 command and can disturb the controller's active state.
+            if link is not None or pending_address is not None:
+                self._rearm()
         elif code == EV_NUM_COMPLETED_PACKETS and params and self.writer is not None:
             for index in range(params[0]):
                 handle, count = struct.unpack_from("<HH", params, 1 + index * 4)
