@@ -71,6 +71,9 @@ LE_CONNECTION_COMPLETE = 0x01
 LE_ENHANCED_CONNECTION_COMPLETE = 0x0A
 LE_ADV_SET_TERMINATED = 0x12
 
+MANAGEMENT_CONNECT_ATTEMPTS = 4
+MANAGEMENT_CONNECT_RETRY_DELAY = 0.15
+
 # Subevents 1..32. A narrower mask hides LE Advertising Set Terminated (0x12), which needs
 # bit 17 and is the only event naming the set a connection arrived on.
 LE_EVENT_MASK = bytes.fromhex("ffffffff00000000")
@@ -617,8 +620,16 @@ class AttManagementClient:
         with self.condition:
             self.notifications.clear()
         self.write_frame(bytes([0x57, 0, 0, 0, 0x0F, 0x63, sub]), response=True)
-        return self.await_notification(
+        deadline = time.monotonic() + timeout
+        first = self.await_notification(
             lambda data: len(data) >= 8 and data[:4] == b"\x01\x00\x00\x00", timeout)
+        if sub != 5:
+            return first
+        frame = bytearray(first)
+        length = 8 + int.from_bytes(frame[4:6], "big")
+        while len(frame) < length:
+            frame.extend(self.await_notification(bool, max(0, deadline - time.monotonic())))
+        return bytes(frame)
 
     def query(self, subcommands: list[tuple[int, float]]) -> list[str]:
         self.prepare()
@@ -1022,41 +1033,66 @@ class MultiAddressServer:
         peer = format_address(address)
         address_bytes(peer)
         with self._management_lock:
-            client = AttManagementClient(peer, lambda pdu: self._central_send(client, pdu))
-            initiated = False
-            result = None
-            failure = None
-            try:
-                with self._io_lock:
-                    if self.channel is None or self._paused.is_set():
-                        raise RuntimeError("raw HCI bridge is not running")
-                    if self._central_client is not None or self._central_link is not None:
-                        raise RuntimeError("previous raw HCI management connection is still closing")
-                    self._central_client = client
-                with self._io_lock:
-                    # BlueZ lib/bluetooth/hci.h: 25-byte le_create_connection_cp.
-                    initiated = True
-                    try:
-                        self.channel.command(OP_LE_CREATE_CONN, struct.pack(
-                            "<HHBB6sBHHHHHH", 0x0060, 0x0030, 0, 0, address_bytes(peer), 0,
-                            self.conn_min, self.conn_max, 0, 400, 0, 0))
-                    except HciCommandError:
-                        initiated = False
-                        raise
-                if not client.connected.wait(8.0):
-                    raise TimeoutError("raw HCI management connection timed out")
-                if client.error:
-                    raise ConnectionError(client.error)
-                result = operation(client)
-            except Exception as err:
-                failure = err
-            finally:
-                # A refused request must not close an older session still owned by the bridge.
-                if self._central_client is client:
-                    try:
-                        self._close_management(client, initiated)
-                    except Exception as err:
-                        failure = RuntimeError(f"{failure}; cleanup: {err}") if failure else err
+            for attempt in range(1, MANAGEMENT_CONNECT_ATTEMPTS + 1):
+                client = AttManagementClient(peer, lambda pdu: self._central_send(client, pdu))
+                initiated = False
+                result = None
+                failure = None
+                try:
+                    with self._io_lock:
+                        if self.channel is None or self._paused.is_set():
+                            raise RuntimeError("raw HCI bridge is not running")
+                        if self._central_client is not None or self._central_link is not None:
+                            raise RuntimeError("previous raw HCI management connection is still closing")
+                        self._central_client = client
+                    with self._io_lock:
+                        # Scan continuously during this short-lived connection attempt. The
+                        # previous 60/30 ms interval/window combination listened only half the
+                        # time and could miss the remote's advertising event.
+                        initiated = True
+                        try:
+                            self.channel.command(OP_LE_CREATE_CONN, struct.pack(
+                                "<HHBB6sBHHHHHH", 0x0060, 0x0060, 0, 0, address_bytes(peer), 0,
+                                self.conn_min, self.conn_max, 0, 400, 0, 0))
+                        except HciCommandError:
+                            initiated = False
+                            raise
+                    if not client.connected.wait(8.0):
+                        raise TimeoutError("raw HCI management connection timed out")
+                    if client.error:
+                        raise ConnectionError(client.error)
+                    result = operation(client)
+                except Exception as err:
+                    failure = err
+                finally:
+                    # A refused request must not close an older session still owned by the bridge.
+                    if self._central_client is client:
+                        try:
+                            self._close_management(client, initiated)
+                        except Exception as err:
+                            failure = RuntimeError(f"{failure}; cleanup: {err}") if failure else err
+
+                if failure is None:
+                    break
+                retryable_connect = (
+                    not client.command_started
+                    and self._central_client is None and self._central_link is None
+                    and isinstance(failure, (ConnectionError, TimeoutError))
+                    and ("central disconnected: 0x3e" in str(failure)
+                         or "central disconnected: 0x08" in str(failure)
+                         or "central connection failed: 0x3e" in str(failure)
+                         or "central connection failed: 0x08" in str(failure)
+                         or "raw HCI management connection timed out" in str(failure))
+                )
+                if not retryable_connect or attempt == MANAGEMENT_CONNECT_ATTEMPTS:
+                    break
+                delay = MANAGEMENT_CONNECT_RETRY_DELAY * (2 ** (attempt - 1))
+                _LOG.warning(
+                    "raw HCI management connection failed before command write (%d/%d): %s; "
+                    "retrying in %.2fs",
+                    attempt, MANAGEMENT_CONNECT_ATTEMPTS - 1, failure, delay)
+                time.sleep(delay)
+
             if failure is not None:
                 if not report_errors:
                     raise failure
@@ -1099,9 +1135,10 @@ class MultiAddressServer:
 
     @_controller_locked
     def _central_send(self, client: AttManagementClient, pdu: bytes) -> None:
-        if (self.writer is None or self._central_client is not client
-                or client.handle is None or client.closed.is_set() or client.error):
+        if self.writer is None or self._central_client is not client:
             raise ConnectionError("raw HCI management connection is closed")
+        if client.handle is None or client.closed.is_set() or client.error:
+            raise ConnectionError(client.error or "raw HCI management connection is closed")
         self.writer.send(client.handle, pdu)
 
     # -- the event loop ------------------------------------------------------------------

@@ -4,6 +4,14 @@ Fake native SwitchBot target for WoRWS. Companion to the
 [SwitchBot Universal Remote integration](https://github.com/batareya16/SwitchbotURCHass),
 whose `PROTOCOL.md` documents the protocol this add-on speaks.
 
+### 0.31.2 — recover transient native management connection failures
+
+The management initiator scans continuously during the short-lived connection attempt.
+Transient controller connection-failed (`0x3e`), link-timeout (`0x08`), and
+connection-wait timeout failures are retried up to three times with a short backoff.
+Retries stop when the management command write starts, so a mutation is never repeated
+because its acknowledgement was lost.
+
 ### 0.31.0 — all multi-address management through raw HCI
 
 HCI commands now preserve interleaved connection events and button packets. ACL replies queue

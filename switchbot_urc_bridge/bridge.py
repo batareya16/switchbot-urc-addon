@@ -40,7 +40,7 @@ import hci_multi
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _LOG = logging.getLogger("bridge")
-BRIDGE_VERSION = "0.31.0"
+BRIDGE_VERSION = "0.31.2"
 
 SVC = "cba20d00-224d-11e6-9fb8-0002a5d5c51b"
 CHAR_WRITE = "cba20002-224d-11e6-9fb8-0002a5d5c51b"
@@ -1023,9 +1023,16 @@ async def _execute_remote_management(
                     CHAR_WRITE, bytes([0x57, 0, 0, 0, 0x0F, 0x63, sub]), response=True
                 )
                 # 0F63 reads reply with the unencrypted 01 00 00 00 ... envelope.
+                deadline = asyncio.get_running_loop().time() + timeout
                 raw = await _await(
                     lambda r: len(r) >= 8 and r[:4] == b"\x01\x00\x00\x00", timeout=timeout
                 )
+                if sub == 5:
+                    frame = bytearray(raw)
+                    length = 8 + int.from_bytes(frame[4:6], "big")
+                    while len(frame) < length:
+                        frame.extend(await _await(bool, deadline - asyncio.get_running_loop().time()))
+                    raw = bytes(frame)
                 responses.append(raw.hex())
             elif kind == "command":
                 plaintext = bytes.fromhex(str(step["plaintext"]))
