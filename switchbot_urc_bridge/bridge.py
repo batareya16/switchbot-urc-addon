@@ -40,7 +40,7 @@ import hci_multi
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _LOG = logging.getLogger("bridge")
-BRIDGE_VERSION = "0.31.2"
+BRIDGE_VERSION = "0.31.3"
 
 SVC = "cba20d00-224d-11e6-9fb8-0002a5d5c51b"
 CHAR_WRITE = "cba20002-224d-11e6-9fb8-0002a5d5c51b"
@@ -1496,10 +1496,55 @@ def add_bridge_characteristics(periph, device) -> None:
     )
 
 
+class NativeSessionHistory:
+    """Keep recent issued IVs across raw HCI reconnects, scoped to the fake target."""
+
+    def __init__(self) -> None:
+        self._targets: dict[str, dict[bytes, tuple[float, int, set[bytes]]]] = {}
+
+    def _sessions(self, target: str):
+        if not target or target == "?":
+            return {}
+        sessions = self._targets.setdefault(target, {})
+        now = time.monotonic()
+        for iv, (issued, _key_id, _frames) in list(sessions.items()):
+            if now - issued >= 60:
+                del sessions[iv]
+        while len(self._targets) > 32:
+            self._targets.pop(next(iter(self._targets)))
+        return sessions
+
+    def issue(self, target: str, iv: bytes, key_id: int) -> None:
+        sessions = self._sessions(target)
+        sessions[iv] = (time.monotonic(), key_id, set())
+        while len(sessions) > 32:
+            sessions.pop(next(iter(sessions)))
+
+    def candidates(self, target: str, key_id: int) -> list[bytes]:
+        return [iv for iv, (_issued, issued_key, _frames) in self._sessions(target).items()
+                if issued_key == key_id]
+
+    def delivered(self, target: str, iv: bytes, command: bytes) -> bool:
+        session = self._sessions(target).get(iv)
+        return session is not None and command in session[2]
+
+    def remember(self, target: str, iv: bytes, command: bytes) -> None:
+        session = self._sessions(target).get(iv)
+        if session is not None:
+            # Repeated identical commands occupy one entry. Bound unusual traffic as well.
+            if command in session[2]:
+                return
+            if len(session[2]) >= 64:
+                del self._targets[target][iv]
+                return
+            session[2].add(command)
+
+
 class SwitchBotDevice:
     """Device-side protocol: get-random handshake + AES-CTR decrypt of the remote's commands."""
 
-    def __init__(self, key: bytes, notify, on_button) -> None:
+    def __init__(self, key: bytes, notify, on_button, *, session_history=None,
+                 target_address=None) -> None:
         self._key = key
         self._notify = notify          # callable(bytes) -> notify on cba20003
         self._on_button = on_button     # callable(label, plain_hex, remote_id, remote_slot)
@@ -1511,6 +1556,8 @@ class SwitchBotDevice:
         self._key_id = 0x95
         self._last_command: bytes | None = None
         self._last_command_at = 0.0
+        self._session_history = session_history
+        self._target_address = target_address or (lambda: "")
 
     def _is_immediate_retry(self, command: bytes) -> bool:
         """Recognize the firmware retry caused by a late/lost application ACK."""
@@ -1523,15 +1570,16 @@ class SwitchBotDevice:
     def _decrypt_command(self, raw: bytes) -> tuple[bytes | None, bytes]:
         """Find the session a command frame belongs to, and decrypt it.
 
-        Bytes 2-3 name the session, and normally that is the answer. They are only two bytes
-        though, and the remote has been seen sending frames naming a session this connection
-        never issued, so the label is a hint rather than proof: every remembered session is
-        tried and the one whose plaintext reads as a bridge event wins. A frame that no session
-        turns into an event is not a press, and publishing it would fire automations on noise.
+        Bytes 2-3 name the session, and normally that is the answer. Try this connection's
+        remembered IVs and recent IVs issued by this fake target before a reconnect. Only an
+        IV that decrypts the payload into a recognized bridge event can recover a press.
         """
         named = self._sessions.get(bytes(raw[2:4]))
         candidates = [named] if named else []
         candidates += [iv for iv in self._sessions.values() if iv is not named]
+        if self._session_history is not None:
+            candidates += [iv for iv in self._session_history.candidates(self._target_address(), raw[1])
+                           if iv not in candidates]
         for candidate in candidates:
             plain = aes_ctr(self._key, candidate, raw[4:])
             remote_id, _slot = decode_event_source(b"\x57" + plain)
@@ -1579,6 +1627,8 @@ class SwitchBotDevice:
             self._key_id = raw[7] if len(raw) > 7 else 0x95
             self._iv = os.urandom(16)
             self._sessions[self._iv[:2]] = self._iv
+            if self._session_history is not None:
+                self._session_history.issue(self._target_address(), self._iv, self._key_id)
             # Bounded: a remote that keeps asking must not grow this without end.
             while len(self._sessions) > 16:
                 self._sessions.pop(next(iter(self._sessions)))
@@ -1586,8 +1636,9 @@ class SwitchBotDevice:
             self._notify(bytes([0x01, 0x00, 0x00, 0x00]) + self._iv)
             return
         # Encrypted command: 57 <keyId> <nonce0> <nonce1> <ciphertext>.
-        if len(raw) >= 4 and raw[0] == 0x57 and self._iv is not None:
-            if raw[1] != self._key_id:
+        if (len(raw) >= 4 and raw[0] == 0x57
+                and (self._iv is not None or self._session_history is not None)):
+            if self._iv is not None and raw[1] != self._key_id:
                 _LOG.warning("encrypted frame uses unexpected keyId=%02x (expected %02x)",
                              raw[1], self._key_id)
             # Bytes 2-3 name the session: they are the first two bytes of the IV the frame was
@@ -1598,9 +1649,8 @@ class SwitchBotDevice:
             iv, plain = self._decrypt_command(raw)
             if iv is None:
                 _LOG.info(
-                    "ignoring a frame naming session %s: no session this connection issued "
-                    "decrypts it into a press (known: %s). The remote flushing something it "
-                    "queued on an earlier connection looks exactly like this.",
+                    "ignoring frame naming session %s: no current or retained IV decrypts "
+                    "it into a press (current sessions: %s)",
                     raw[2:4].hex(),
                     ", ".join(key.hex() for key in self._sessions) or "none",
                 )
@@ -1628,14 +1678,23 @@ class SwitchBotDevice:
             # to retransmit the command.
             # Acknowledged in the frame's own session, not the newest one, or the remote
             # cannot match the answer to the command it sent.
+            recovered = iv not in self._sessions.values()
             ack = aes_ctr(self._key, iv, bytes([0x01]))
-            self._notify(bytes([0x01, self._key_id, iv[0], iv[1]]) + ack)
+            self._notify(bytes([0x01, raw[1], iv[0], iv[1]]) + ack)
+            if recovered:
+                _LOG.info("recovered encrypted command from a recent connection: session=%s",
+                          iv[:2].hex())
+                if self._session_history.delivered(self._target_address(), iv, full):
+                    _LOG.info("previously delivered encrypted command acknowledged without a second HA event")
+                    return
             # Publish unknown commands too: the first live press is protocol evidence and must
             # not disappear merely because the local map does not know it yet.
             if self._is_immediate_retry(full):
                 _LOG.info("duplicate encrypted command acknowledged without a second HA event")
             else:
                 self._on_button(label, full.hex(), remote_id, remote_slot)
+                if self._session_history is not None:
+                    self._session_history.remember(self._target_address(), iv, full)
             return
         _LOG.info("unhandled write (no IV yet / bad frame): %s", raw.hex())
 
@@ -2493,6 +2552,7 @@ def run_multi_address(
     if not multi:
         return False
 
+    session_history = NativeSessionHistory()
     server = hci_multi.MultiAddressServer(
         name,
         addresses,
@@ -2503,6 +2563,8 @@ def run_multi_address(
             lambda label, ph, remote_id, remote_slot: mq.publish(
                 label, ph, remote_id=remote_id, remote_slot=remote_slot
             ),
+            session_history=session_history,
+            target_address=address_of,
         ),
         conn_min=WORWS_CONN_MIN,
         conn_max=WORWS_CONN_MAX,

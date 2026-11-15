@@ -4,6 +4,14 @@ Fake native SwitchBot target for WoRWS. Companion to the
 [SwitchBot Universal Remote integration](https://github.com/batareya16/SwitchbotURCHass),
 whose `PROTOCOL.md` documents the protocol this add-on speaks.
 
+### 0.31.3 — recover queued encrypted presses after reconnects
+
+The raw HCI bridge retains issued session IVs for 60 seconds per fake-target address.
+A queued encrypted press from an earlier connection can be decrypted and acknowledged
+in its original session. An already delivered frame receives another acknowledgement
+without publishing a duplicate Home Assistant event. History is bounded, kept in memory,
+and cleared when the add-on restarts. Frames that no retained IV can decrypt are ignored.
+
 ### 0.31.2 — recover transient native management connection failures
 
 The management initiator scans continuously during the short-lived connection attempt.
