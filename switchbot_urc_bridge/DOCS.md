@@ -12,7 +12,7 @@ The Bridge connects your physical SwitchBot Universal Remote (WoRWS) to Home Ass
 
 1. Add the repository to Home Assistant. In **Settings → Apps → Install app → ⋮ → Repositories**, add `https://github.com/batareya16/switchbot-urc-addon`. Older versions call this the **Add-on Store**. Install **SwitchBot URC Bridge**.
 2. Plug in the dedicated dongle. In **Settings → Connectivity → Bluetooth → Adapters**, note its Bluetooth address and disable Home Assistant's use of **that dongle**. Keep the dongle plugged in and leave your regular adapter enabled. The Bridge needs direct access to its dongle to receive connections from the remote. [Find your Bluetooth adapters](https://www.home-assistant.io/connectivity/bluetooth/#viewing-your-bluetooth-adapters-and-proxies)
-3. In the Bridge's **Configuration** tab, set `adapter` to that Bluetooth address. For a new setup, replace `device_key` with a private random value of 32 characters using only `0–9` and `a–f`. If you already use the Bridge, keep your existing key so your remotes can still connect.
+3. In the Bridge's **Configuration** tab, set **Bluetooth adapter** (`adapter`) to that address. For a new setup, replace **Bridge device key** (`device_key`) with a private random value of 32 characters using only `0–9` and `a–f`. If you already use the Bridge, keep your existing key so your remotes can still connect.
 4. Leave **Addresses (optional)** empty for automatic setup. Save, start the Bridge and enable **Start on boot**. The **Log** tab should show `multi-address bridge running`.
 
 ## Add your first remote
@@ -25,16 +25,32 @@ To add another Bridge remote, repeat step 1. Studio chooses a free address autom
 
 ## Configuration reference
 
+For a new setup, fill in **Bluetooth adapter** and **Bridge device key**. Leave the other fields at their defaults. If you use **Edit in YAML**, this is what a complete configuration looks like:
+
+```yaml
+adapter: "02:11:22:33:44:55"
+device_key: "f1a09c4b7d2e658301be4d96c8a72f50"
+addresses: ""
+remote_address: ""
+mqtt_topic: "switchbot_urc/button"
+discovery: true
+hci_trace: false
+conn_interval_min_ms: 7.5
+conn_interval_max_ms: 15.0
+```
+
+Replace the example adapter address with your dongle's Bluetooth address. The example key is public. Generate your own with a password manager set to generate 32 characters from `0123456789abcdef`, or run `openssl rand -hex 16` in a terminal. Paste the resulting key into the Bridge and into Remote Studio when prompted.
+
 | Setting | What it does |
 | --- | --- |
-| `adapter` | Bluetooth address of the dedicated dongle, for example `00:11:22:33:44:55`. A name such as `hci1` also works, but can change after a restart or replug. |
-| `device_key` | The private 32-character hexadecimal key shared with Remote Studio. |
-| `addresses` | Optional comma-separated addresses to use first. Leave empty for automatic setup. New custom virtual addresses must start with `C0`–`FF`. |
-| `remote_address` | Optional Bluetooth address of the physical Universal Remote, used for diagnostics and to identify it to the integration. Leave blank for a standard install. |
-| `mqtt_topic` | Topic for button events. Keep `switchbot_urc/button` for Remote Studio. |
-| `discovery` | Publishes the MQTT button event entity and device triggers for Home Assistant when enabled. |
-| `hci_trace` | Adds Bluetooth diagnostics to the log. Enable it when investigating a connection problem. |
-| `conn_interval_min_ms`, `conn_interval_max_ms` | Advanced Bluetooth connection preferences. The defaults are `7.5` and `15.0` milliseconds. The physical remote negotiates the actual interval. |
+| **Bluetooth adapter** (`adapter`) | Enter the address of the dedicated dongle as six colon-separated pairs, for example `02:11:22:33:44:55`. A name such as `hci1` also works, but can change after a restart or replug. |
+| **Bridge device key** (`device_key`) | Enter 32 hexadecimal characters as one string, without spaces. Use the same key in Remote Studio. |
+| **Addresses (optional)** (`addresses`) | Leave blank in the form or use `""` in YAML for automatic allocation. To prioritize specific addresses, enter one comma-separated string such as `C0:12:34:56:78:90, C1:12:34:56:78:90`. Each new custom virtual address must start with `C0`–`FF`. |
+| **Universal Remote address (optional)** (`remote_address`) | Leave blank in the form or use `""` in YAML for a standard install. For diagnostics, enter the Bluetooth address of the physical remote, for example `02:66:77:88:99:AA`. Find it on the Universal Remote's integration page in Home Assistant. |
+| **MQTT button topic** (`mqtt_topic`) | Keep `switchbot_urc/button` so Remote Studio receives button events. |
+| **MQTT discovery** (`discovery`) | Leave on (`true`) to create the MQTT button event entity and device triggers in Home Assistant. |
+| **Bluetooth trace logging** (`hci_trace`) | Leave off (`false`) for normal use. Turn on temporarily to collect a detailed Bluetooth log. |
+| **Minimum and maximum connection interval** (`conn_interval_min_ms`, `conn_interval_max_ms`) | Keep `7.5` and `15.0` for normal use. Enter numbers in milliseconds, with a decimal point and no unit suffix. The physical remote chooses the actual interval. |
 
 ## If something doesn't work
 

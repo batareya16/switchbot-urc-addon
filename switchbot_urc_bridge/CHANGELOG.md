@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.1
+
+- Adds help for each field in the Configuration tab and a complete YAML example in Documentation.
+
 ## 0.32.0
 
 - The Bridge automatically assigns and remembers addresses for each dongle.
