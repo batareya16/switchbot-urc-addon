@@ -42,8 +42,8 @@ specify accepted response codes. The bridge never automatically repeats a comman
 acknowledgement. Protocol errors do not count as physical disconnects: a new management
 connection waits for confirmed cleanup of the old one.
 
-This path has scripted ATT/HCI and crypto tests; it still requires hardware validation. The
-single-address path for older controllers continues to use BlueZ.
+Since 0.32, the add-on uses raw HCI for every controller. Startup requires a controller with
+extended advertising support.
 
 Firmware analysis confirms that a native button press makes
 the remote connect directly to the MAC saved by `0F 20 08`, discover the standard SwitchBot GATT
@@ -69,9 +69,8 @@ provide. The add-on owns the second adapter, exposes service `cba20d00` with wri
 ## Requirements
 
 - A **second** Bluetooth adapter (USB dongle). One adapter stays with Home Assistant's Bluetooth
-  integration; this add-on owns the other as a peripheral. Disable that adapter in Home
-  Assistant's Bluetooth adapter settings; setting `diagnostic_scan: false` only disables this
-  add-on's scanner, not another BlueZ client's scan.
+  integration; use a dedicated adapter with extended advertising for this add-on. Disable the
+  dedicated adapter in Home Assistant's Bluetooth adapter settings.
 - Set `adapter` to the controller's **MAC address** rather than `hciN` where you can. Kernel
   numbering is not stable — a reboot or a replug can swap hci0 and hci1, and the add-on then
   silently owns the wrong radio.
@@ -82,21 +81,24 @@ Each native tile connects to one fixed BLE address, so several tiles need severa
 **There is nothing to configure.** Whether a controller can carry several addresses is a
 property of the radio, so the add-on asks the kernel at startup and decides for itself:
 
-- A **Bluetooth 5** controller is taken on the HCI user channel and serves one advertising set
-  per address, starting with its own. Remote Studio allocates each further address, tells the
-  add-on to serve it, and the add-on keeps it in `/data` across restarts.
-- A **Bluetooth 4** controller keeps the original BlueZ path and its single address, exactly as
-  before. So does a Bluetooth 5 one that cannot be claimed, for instance because something else
-  still holds it. The log line says which path was taken and why.
+- The add-on fills the controller's advertising sets at startup and reports the addresses it
+  successfully enabled to Remote Studio. With a fresh configuration, the controller's own address
+  is first and extra addresses are stable static random addresses. If the controller rejects the
+  requested number of connectable sets, the bridge keeps the smaller pool it can enable.
 
-The only setting that matters is **`adapter`, which should be a MAC rather than `hciN`**: kernel
-numbering is not stable across reboots and replugs, and the add-on would otherwise claim
-whichever radio happens to be at that number.
+Remote Studio assigns a free address during **Add a remote → Bridge remote**. Enter the add-on's
+device key on first setup if Studio has no key saved for the bridge. **Bridge options** lets you
+choose a particular free address.
 
-`addresses` is still there, but only to pin a specific list — a second controller you want to
-reserve, or an address chosen by hand. It is never required, and the controller's own address is
-always served whether it is listed or not. Any address added by hand must be a static random
-address, first octet `C0` or higher.
+**Addresses (optional)** is a comma-separated list of addresses to use first. The add-on keeps
+previously served addresses across restarts and fills any remaining sets automatically. New
+custom virtual addresses should be static random addresses with a first octet of `C0`–`FF`.
+A tile already bound to an address needs that address to remain in the active pool.
+
+Each add-on instance uses one Bluetooth adapter. To serve two adapters at once, run a separate
+instance for each, with its own `adapter` setting and data directory. Each instance generates
+its pool from its controller's address.
+
 - The MQTT integration/broker.
 
 ## Install
@@ -106,49 +108,16 @@ address, first octet `C0` or higher.
 3. Configure:
    - `adapter`: the dedicated dongle as `hci1` or a MAC such as `00:11:22:33:44:55`.
    - `remote_address`: physical WoRWS MAC, used for connection diagnostics.
-   - `name`: advertised name, for example `HASS Light`.
    - `mqtt_topic`: defaults to `switchbot_urc/button`.
    - `discovery`: creates a Home Assistant MQTT event entity.
-   - `diagnostic_scan`: keep `false`. An active scan can interfere with connectable peripheral mode
-     on some controllers; enable it only for advertisement capture.
-   - `hci_trace`: keep `true` while diagnosing. It logs only advertising, connection/disconnection,
-     and ATT packets; turn it off after button reception works.
-   - `prewarm_remote_cache`: deprecated; set it to `false`. It remains accepted so existing add-on
-     configurations continue to validate, but version 0.10.6 ignores it because BlueZ still runs
-     reverse validation and delayed prewarm connections can block GATT-server registration.
-   - `direct_att`: keep `true`. Version 0.11.0 uses a synchronous ATT server on the dedicated
-     adapter to avoid WoRWS's two-second BlueZ discovery timeout. If the fixed ATT CID cannot be
-     bound, the add-on logs the reason and automatically uses the D-Bus GATT server.
-   - `raw_att_idle_timeout`: seconds a silent raw-ATT peer may hold the single connection slot
-     before the add-on drops it (default `6.0`). WoRWS opens a fresh link per press and retries up
-     to five times; a half-open link the kernel never reports as closed would otherwise wedge the
-     server and make the next press wait. A real press completes in well under a second, so the
-     default never interrupts one. Lower it only if consecutive presses still queue behind a stale
-     link; raise it if a slow adapter drops healthy links. The per-press `t_subscribe`/`t_write`/
-     `t_ack`/`write_to_ack` latencies now printed in each `raw ATT session summary` show the margin.
-   - `raw_att_keepalive_interval` / `raw_att_keepalive_window`: after a real native command has
-     been acknowledged, repeat that exact ACK every `1.0` second for at most `300.0` seconds. WoRWS
-     firmware resets its bounded native-target transaction countdown whenever it processes the
-     completion event; keeping the already-discovered link warm removes the multi-second discovery
-     delay from the next press. No keepalive is sent before CCCD subscription or before the first
-     real command, and it never publishes a duplicate Home Assistant event. Set either value to
-     `0` to disable this experiment. Version 0.19.26 automatically migrates the former default
-     `30.0`-second window to five minutes while preserving every custom value.
-     Version 0.19.32 also waits for the kept-alive radio link to be fully released before a
-     management handshake, so adding or editing a remote no longer races the warm connection.
-   - `conn_interval_min_ms` / `conn_interval_max_ms`: the BLE connection interval range (in ms) the
-     bridge requests — used for the adapter default, the per-remote kernel parameters, and the
-     advertised AD type 0x12. Default `7.5`/`15.0`. The WoRWS central picks the actual interval, and
-     on a slow CSR 4.0 link it may ignore this and run so slowly that native-press discovery barely
-     fits its ~2 s deadline (first press lands, repeats stall at `descriptor-discovery`). Try a
-     wider range such as `15.0`/`30.0` and compare the `t_subscribe`/`t_write` values in the `raw
-     ATT session summary`: if they change, WoRWS honored it; if they are unchanged, the firmware is
-     ignoring the range and a BLE 5.0 adapter (which negotiates a fast interval natively) is the real
-     fix. Valid range 7.5–4000 ms; invalid values fall back to the default.
+   - `hci_trace`: enable filtered advertising, connection and ATT logs when diagnosing.
+   - `conn_interval_min_ms` / `conn_interval_max_ms`: the connection interval range advertised to
+     the remote, in milliseconds (default `7.5`/`15.0`). The WoRWS central chooses the actual
+     interval.
    - `device_key`: the same 16-byte key used by `bind_native` (32 hex characters).
 4. Start the add-on and note the exact adapter MAC printed in its log.
 
-The add-on fails instead of silently falling back to another adapter and never logs `device_key`.
+If startup fails, the log identifies the configured adapter and reports the controller error.
 
 ## Bind the remote
 
@@ -190,67 +159,18 @@ two-characteristic discovery response is silently discarded by the remote.
 
 ## Diagnostics
 
-At startup, look for `active scanning is disabled`, `GATT application registered` and
-`Advertisement registered`. The add-on advertises the full native discovery payload (`FD3D` device
-type and the company `0x0969` MAC/status record) while keeping the 128-bit GATT UUID out of the
-legacy packet so it does not overflow, and requests a 20 ms advertising interval — verify that
-`HCI TRACE` reports `20.000 msec`.
+At startup, look for `multi-address bridge running` and its list of active addresses.
+On a press, look for `connected handle=`, `notify sub=True`, `REMOTE wrote` and the button
+event. The disconnect summary includes `t_subscribe`, `t_write`, `t_ack` and `write_to_ack`.
 
-On a press the expected sequence is `PERIPHERAL CONNECTED`, `notify sub=True`, `REMOTE wrote`,
-then the decoded command and `native command ack -> 01`. If no peer state appears at all, check
-that the MAC passed to `bind_native` exactly matches the adapter MAC printed by the add-on.
-
-If a peer connects and immediately disconnects, leave `hci_trace: true` and copy the `HCI TRACE`
-blocks for one press. The `Disconnect Complete` block carries the controller's reason, and the ATT
-blocks show how far discovery got.
-
-Each press prints a `raw ATT session summary` with `t_subscribe`, `t_write`, `t_ack` and
-`write_to_ack`. Use those numbers rather than guesses when changing connection intervals: if they
-do not move when you widen `conn_interval_min_ms`/`conn_interval_max_ms`, the firmware is ignoring
-the request and only a BLE 5.0 adapter will help.
-
-### When the system bus goes away
-
-If `bluetoothd` or the system bus restarts under the add-on, python-dbus keeps dispatching
-signals on a closed connection and bluezero's handler raises on every one of them. The log fills
-with identical `org.freedesktop.DBus.Error.Disconnected` tracebacks and the bridge never serves
-another press.
-
-The add-on now detects that and exits, and `run.sh` restarts it after five seconds. A restart is
-what actually recovers the service; staying up on a dead bus does not.
+Enable `hci_trace` to capture one ATT session. The `Disconnect Complete` block reports the
+controller's reason. Verify that the saved target address appears in the active address list.
 
 ### Management sessions
 
-On the multi-address path, management uses raw HCI/ATT exclusively. Errors include
-`failed_stage`, `stage_detail`, completed responses and whether a command may already have
-been written. A post-write timeout is not retried by the bridge. Bind/delete still require
-the normal inventory verification in the integration; an ACK alone does not prove that the
-expected table change occurred.
-
-The following BlueZ diagnostics apply to the older single-address path:
-
-Two failure modes were seen repeatedly during a long device session and are now handled.
-
-BlueZ sometimes returns a GATT table **without** the SwitchBot characteristics (`cba20002` /
-`cba20003`): the connect succeeds and the handshake then fails with
-`Characteristic ... was not found`. The connect loop checks for both characteristics and treats
-their absence as a failed attempt, so it clears the cached device and rediscovers instead of
-aborting the session. After this change the same remote started answering a status poll with a
-full 20-byte reply instead of a bare 4-byte envelope.
-
-A session can also reject its **first** command with `04` even when that command is the one-byte
-status poll that succeeds moments later. Codes from such a session say nothing about the command.
-The integration retries the whole step list once with a fresh connection and handshake when the
-first step comes back `04`; this is safe because `04` means the firmware rejected the command
-without applying it, and no later step ran.
-
-When reading a probe's result, send `02` as the first step and discard the run unless it answers
-`01`. Several conclusions during that session were drawn from sessions that had already failed
-this check and had to be withdrawn.
-
-Repeated `RAW ATT CONNECTED` / `session summary ... subscribed=False device_writes=0` lines before
-a delivered press are normal for this remote and bridge, and were observed for a tile that works.
-They are not by themselves a sign of a broken profile.
+Management uses the same raw HCI controller. Errors include `failed_stage`, `stage_detail`,
+completed responses and whether a command may already have been written. The integration
+verifies bind and delete results against the device table.
 
 ## License
 

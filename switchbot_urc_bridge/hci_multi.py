@@ -67,6 +67,7 @@ EV_CMD_STATUS = 0x0F
 EV_NUM_COMPLETED_PACKETS = 0x13
 EV_LE_META = 0x3E
 STATUS_UNKNOWN_COMMAND = 0x01
+STATUS_CONNECTION_LIMIT = 0x09
 LE_CONNECTION_COMPLETE = 0x01
 LE_ENHANCED_CONNECTION_COMPLETE = 0x0A
 LE_ADV_SET_TERMINATED = 0x12
@@ -248,41 +249,13 @@ def probe_capabilities(index: int, timeout: float = 3.0) -> tuple[bool, int]:
         sock.close()
 
 
-def plan_mode(
-    extended: bool,
-    sets: int,
-    own_address: str,
-    configured: list[str],
-    remembered: list[str],
-) -> tuple[bool, list[str], str]:
-    """Decide which path to run and which addresses to serve.
-
-    Kept free of sockets so the decision can be tested on its own. Returns
-    ``(serve several addresses, the list, why)``. The controller's own address always comes
-    first: every tile bound before any of this existed points at it.
-    """
-    wanted: list[str] = []
-    for item in [own_address, *configured, *remembered]:
-        if not item or not is_address(item):
-            continue
-        if not any(normalise(item) == normalise(seen) for seen in wanted):
-            wanted.append(format_address(normalise(item)))
-    if not wanted:
-        return False, [], "no usable address is known for this controller"
-    if not extended:
-        if len(configured) > 1:
-            return False, wanted[:1], (
-                f"{len(configured)} addresses are configured, but this controller does not do "
-                "extended advertising and can only ever serve one"
-            )
-        return False, wanted[:1], "this controller does not do extended advertising"
-    if len(wanted) > sets:
-        kept, dropped = wanted[:sets], wanted[sets:]
-        return True, kept, (
-            f"this controller has {sets} advertising set(s), so {', '.join(dropped)} "
-            "cannot be served"
-        )
-    return True, wanted, f"extended advertising with {sets} set(s)"
+def address_pool(own_address: str, seeds: list[str], capacity: int) -> list[str]:
+    """Keep existing assignments first, then fill with stable static random addresses."""
+    own = normalise(own_address)
+    if not is_address(own):
+        raise ValueError("the controller did not report a Bluetooth address")
+    candidates = [*seeds, own, *(f"{first:02X}{own[2:]}" for first in range(0xC0, 0x100))]
+    return list(dict.fromkeys(format_address(item) for item in candidates if is_address(item)))[:capacity]
 
 
 def is_address(value: str) -> bool:
@@ -712,14 +685,16 @@ class MultiAddressServer:
         conn_min: int,
         conn_max: int,
         advertising_interval_ms: float = 100.0,
+        auto_fill: bool = False,
     ) -> None:
-        if not addresses:
+        if not addresses and not auto_fill:
             raise ValueError("at least one address is required")
         self.adapter, self.index, self.expected_address = resolve_adapter(adapter)
         if self.adapter != adapter.strip():
             _LOG.info("adapter %r resolved to %s (%s)",
                       adapter, self.adapter, self.expected_address or "address unknown")
         self.addresses = addresses
+        self.auto_fill = auto_fill
         self.protocol_factory = protocol_factory
         self.device_factory = device_factory
         self.conn_min = conn_min
@@ -733,7 +708,6 @@ class MultiAddressServer:
         self.extended_advertising = False
         self._enable_frame = b""
         self._stop = threading.Event()
-        self._paused = threading.Event()
         self._thread: threading.Thread | None = None
         self._io_lock = threading.RLock()
         self._pending_set_addresses: dict[int, str] = {}
@@ -780,10 +754,18 @@ class MultiAddressServer:
                 raise RuntimeError(
                     f"{self.adapter} ({self.own_public}) does not support extended advertising, "
                     "so it can only ever serve one address. Check that this is the Bluetooth 5 "
-                    "adapter — hci numbering changes across reboots and replugs — or leave the "
-                    "addresses option empty to keep the single-address BlueZ path."
+                    "adapter — hci numbering changes across reboots and replugs."
                 ) from None
             raise
+        if not available:
+            raise RuntimeError(f"{self.adapter} has no advertising sets")
+        if self.auto_fill:
+            configured = list(dict.fromkeys(format_address(item) for item in self.addresses
+                                            if is_address(item)))
+            if len(configured) > available:
+                _LOG.warning("%s cannot fit the saved addresses %s", self.adapter,
+                             ", ".join(configured[available:]))
+            self.addresses = address_pool(self.own_public, configured, available)
         if len(self.addresses) > available:
             raise RuntimeError(
                 f"{self.adapter} ({self.own_public}) offers {available} advertising set(s) but "
@@ -795,8 +777,23 @@ class MultiAddressServer:
         self.writer = AclWriter(channel, payload_size, credits)
         for handle, address in enumerate(self.addresses):
             self._configure_set(handle, address)
-        self._rebuild_enable_frame()
-        channel.command(OP_LE_SET_EXT_ADV_ENABLE, self._enable_frame)
+        requested = list(self.addresses)
+        while self.addresses:
+            self._rebuild_enable_frame()
+            try:
+                channel.command(OP_LE_SET_EXT_ADV_ENABLE, self._enable_frame)
+                break
+            except HciCommandError as err:
+                if not self.auto_fill or err.status != STATUS_CONNECTION_LIMIT or len(self.addresses) == 1:
+                    raise
+                channel.command(OP_LE_SET_EXT_ADV_ENABLE, bytes([0x00, 0x00]))
+                self.addresses.pop()
+        if self.auto_fill:
+            self.advertising_sets = len(self.addresses)
+        if len(self.addresses) < len(requested):
+            _LOG.warning("%s enabled %d/%d connectable addresses; controller refused %s (0x09)",
+                         self.adapter, len(self.addresses), len(requested),
+                         ", ".join(requested[len(self.addresses):]))
         _LOG.info("%s claimed: public %s, ACL payload %d B, %d buffers, serving %s",
                   self.adapter, self.own_public, payload_size, credits,
                   ", ".join(self.addresses))
@@ -825,7 +822,7 @@ class MultiAddressServer:
         self.writer = None
         self.links.clear()
         self._pending_set_addresses.clear()
-        _LOG.info("%s returned to BlueZ: %s", self.adapter, set_powered(self.index, True))
+        _LOG.info("%s released to the host: %s", self.adapter, set_powered(self.index, True))
 
     @staticmethod
     def _buffer_size(channel: UserChannel) -> tuple[int, int]:
@@ -884,6 +881,11 @@ class MultiAddressServer:
         }
 
     @_controller_locked
+    def serves_address(self, address: str) -> bool:
+        return self.channel is not None and format_address(address) in self.addresses
+
+
+    @_controller_locked
     def set_addresses(self, addresses: list[str]) -> list[str]:
         """Serve a different set of addresses, without restarting the add-on.
 
@@ -894,7 +896,7 @@ class MultiAddressServer:
         if any(not is_address(item) for item in addresses):
             raise ValueError("every target must be a six-byte Bluetooth address")
         wanted = list(dict.fromkeys(format_address(item) for item in addresses))
-        if any(normalise(item) != normalise(self.own_public)
+        if any(item not in self.addresses and normalise(item) != normalise(self.own_public)
                and (address_bytes(item)[5] & 0xC0) != 0xC0 for item in wanted):
             raise ValueError("virtual targets must use static random addresses (C0–FF first octet)")
         if not wanted:
@@ -904,11 +906,10 @@ class MultiAddressServer:
                 f"{self.adapter} has {self.advertising_sets} advertising set(s), "
                 f"so it cannot serve {len(wanted)} addresses"
             )
-        if [normalise(item) for item in wanted] == [normalise(item) for item in self.addresses]:
-            return list(self.addresses)
         if self.channel is None:
-            self.addresses = wanted
-            return wanted
+            raise RuntimeError("the raw HCI bridge is not running")
+        if wanted == self.addresses:
+            return list(self.addresses)
         # A connection may have arrived while an HCI command was being acknowledged. Apply
         # its deferred events before deciding which advertising sets are safe to change.
         while self.channel.spare:
@@ -958,27 +959,6 @@ class MultiAddressServer:
         if self._thread is not None:
             self._thread.join(timeout=3.0)
         self._release()
-
-    @_controller_locked
-    def pause(self) -> bool:
-        """Hand the controller back so the integration can run a management session on it."""
-        if self._paused.is_set():
-            _LOG.info("multi-address bridge already paused; no-op")
-            return True
-        self._paused.set()
-        self._release()
-        _LOG.info("multi-address bridge paused; %s is BlueZ's again", self.adapter)
-        return True
-
-    @_controller_locked
-    def resume(self) -> bool:
-        if not self._paused.is_set():
-            _LOG.info("multi-address bridge already running; resume no-op")
-            return True
-        self._claim()
-        self._paused.clear()
-        _LOG.info("multi-address bridge resumed")
-        return True
 
     def query_inventory(self, address: str, steps: list[dict]) -> dict:
         """Read via our central connection while continuing to serve peripheral connections.
@@ -1040,7 +1020,7 @@ class MultiAddressServer:
                 failure = None
                 try:
                     with self._io_lock:
-                        if self.channel is None or self._paused.is_set():
+                        if self.channel is None:
                             raise RuntimeError("raw HCI bridge is not running")
                         if self._central_client is not None or self._central_link is not None:
                             raise RuntimeError("previous raw HCI management connection is still closing")
@@ -1179,12 +1159,12 @@ class MultiAddressServer:
             self._stop.wait(0.001)
 
     def _serve_once(self) -> None:
-        if self._paused.is_set() or self.channel is None:
+        if self.channel is None:
             return
         try:
             packet = self.channel.read(0.1)
         except OSError as err:
-            if not self._stop.is_set() and not self._paused.is_set():
+            if not self._stop.is_set():
                 _LOG.warning("HCI read failed: %s", err)
             return
         if packet is None:

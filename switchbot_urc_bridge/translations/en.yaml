@@ -1,0 +1,4 @@
+configuration:
+  addresses:
+    name: "Addresses (optional)"
+    description: "Leave empty for automatic allocation. To prioritize specific addresses, enter a comma-separated list."

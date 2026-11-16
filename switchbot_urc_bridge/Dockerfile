@@ -3,20 +3,10 @@
 ARG BUILD_FROM=ghcr.io/home-assistant/aarch64-base:latest
 FROM ${BUILD_FROM}
 
-# BlueZ client libs + python BLE-peripheral + MQTT.
-RUN apk add --no-cache \
-      bluez \
-      bluez-btmon \
-      bluez-libs \
-      dbus \
-      python3 \
-      py3-pip \
-      py3-dbus \
-      py3-gobject3 \
+# btmon is only used when the optional HCI trace is enabled.
+RUN apk add --no-cache bluez-btmon python3 py3-pip \
     && pip3 install --no-cache-dir --break-system-packages \
-      bluezero==0.9.0 \
       paho-mqtt==2.1.0 \
-      "bleak>=1.0,<2" \
       cryptography
 
 COPY run.sh /run.sh

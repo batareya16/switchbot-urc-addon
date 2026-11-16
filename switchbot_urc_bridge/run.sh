@@ -2,45 +2,22 @@
 # Read add-on options + MQTT service credentials, then launch the BLE-peripheral bridge.
 set -e
 
+# Supervisor can retain the options saved by older releases.
+for option in name diagnostic_scan prewarm_remote_cache direct_att raw_att_idle_timeout \
+  raw_att_keepalive_interval raw_att_keepalive_window; do
+  if bashio::config.exists "${option}"; then
+    bashio::addon.option "${option}" || bashio::log.warning "Could not remove obsolete option ${option}"
+  fi
+done
+
 ADAPTER="$(bashio::config 'adapter')"
 ADDRESSES="$(bashio::config 'addresses')"
 # bashio renders an unset optional as the string "null"; the bridge wants it empty.
 if [ "${ADDRESSES}" = "null" ]; then ADDRESSES=""; fi
 REMOTE_ADDRESS="$(bashio::config 'remote_address')"
-NAME="$(bashio::config 'name')"
 TOPIC="$(bashio::config 'mqtt_topic')"
 DISCOVERY="$(bashio::config 'discovery')"
-DIAGNOSTIC_SCAN="$(bashio::config 'diagnostic_scan')"
 HCI_TRACE="$(bashio::config 'hci_trace')"
-PREWARM_REMOTE_CACHE="$(bashio::config 'prewarm_remote_cache')"
-if bashio::config.has_value 'direct_att'; then
-  DIRECT_ATT="$(bashio::config 'direct_att')"
-else
-  DIRECT_ATT="true"
-fi
-if bashio::config.has_value 'raw_att_idle_timeout'; then
-  RAW_ATT_IDLE_TIMEOUT="$(bashio::config 'raw_att_idle_timeout')"
-else
-  RAW_ATT_IDLE_TIMEOUT="6.0"
-fi
-if bashio::config.has_value 'raw_att_keepalive_interval'; then
-  RAW_ATT_KEEPALIVE_INTERVAL="$(bashio::config 'raw_att_keepalive_interval')"
-else
-  RAW_ATT_KEEPALIVE_INTERVAL="1.0"
-fi
-if bashio::config.has_value 'raw_att_keepalive_window'; then
-  RAW_ATT_KEEPALIVE_WINDOW="$(bashio::config 'raw_att_keepalive_window')"
-else
-  RAW_ATT_KEEPALIVE_WINDOW="300.0"
-fi
-# Supervisor retains the old default after an add-on update. Migrate only the exact 0.19.25
-# 30-second default; a value deliberately customized by the user remains untouched.
-case "${RAW_ATT_KEEPALIVE_WINDOW}" in
-  "30"|"30.0")
-    RAW_ATT_KEEPALIVE_WINDOW="300.0"
-    bashio::log.info "Migrated native ACK keepalive window from 30s to 300s"
-    ;;
-esac
 if bashio::config.has_value 'conn_interval_min_ms'; then
   CONN_INTERVAL_MIN_MS="$(bashio::config 'conn_interval_min_ms')"
 else
@@ -72,23 +49,8 @@ else
   bashio::log.warning "No MQTT service — button events will only be logged."
 fi
 
-export ADAPTER ADDRESSES REMOTE_ADDRESS NAME TOPIC DISCOVERY DIAGNOSTIC_SCAN HCI_TRACE \
-  PREWARM_REMOTE_CACHE DEVICE_KEY
-export DIRECT_ATT RAW_ATT_IDLE_TIMEOUT RAW_ATT_KEEPALIVE_INTERVAL \
-  RAW_ATT_KEEPALIVE_WINDOW CONN_INTERVAL_MIN_MS CONN_INTERVAL_MAX_MS
+export ADAPTER ADDRESSES REMOTE_ADDRESS TOPIC DISCOVERY HCI_TRACE DEVICE_KEY
+export CONN_INTERVAL_MIN_MS CONN_INTERVAL_MAX_MS
 
-bashio::log.info "Starting SwitchBot URC Bridge on adapter ${ADAPTER} as '${NAME}'"
-
-# The bridge exits on conditions it cannot recover from in place — most often the system bus
-# closing under it when bluetoothd restarts. Restarting it here is what actually recovers the
-# service; without this the add-on would simply stay down until someone noticed.
-while true; do
-  python3 -u /bridge.py
-  status=$?
-  if [ "${status}" -eq 0 ]; then
-    bashio::log.info "bridge exited normally"
-    break
-  fi
-  bashio::log.warning "bridge exited with status ${status}; restarting in 5s"
-  sleep 5
-done
+bashio::log.info "Starting SwitchBot URC Bridge on adapter ${ADAPTER}"
+exec python3 -u /bridge.py
