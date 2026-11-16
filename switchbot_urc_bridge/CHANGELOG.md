@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.2
+
+- Shows Linux adapter names such as `hci0` and `hci1` in setup examples.
+- Clarifies that Refresh uses the remote address saved in the integration.
+
 ## 0.32.1
 
 - Adds help for each field in the Configuration tab and a complete YAML example in Documentation.
