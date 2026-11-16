@@ -11,8 +11,8 @@ The Bridge connects your physical SwitchBot Universal Remote (WoRWS) to Home Ass
 ## Install and start
 
 1. Add the repository to Home Assistant. In **Settings → Apps → Install app → ⋮ → Repositories**, add `https://github.com/batareya16/switchbot-urc-addon`. Older versions call this the **Add-on Store**. Install **SwitchBot URC Bridge**.
-2. Plug in the dedicated dongle. In **Settings → Connectivity → Bluetooth → Adapters**, note its Bluetooth address and disable Home Assistant's use of **that dongle**. Keep the dongle plugged in and leave your regular adapter enabled. The Bridge needs direct access to its dongle to receive connections from the remote. [Find your Bluetooth adapters](https://www.home-assistant.io/connectivity/bluetooth/#viewing-your-bluetooth-adapters-and-proxies)
-3. In the Bridge's **Configuration** tab, set **Bluetooth adapter** (`adapter`) to that address. For a new setup, replace **Bridge device key** (`device_key`) with a private random value of 32 characters using only `0–9` and `a–f`. If you already use the Bridge, keep your existing key so your remotes can still connect.
+2. Plug in the dedicated dongle. In **Settings → Connectivity → Bluetooth → Adapters**, note its Linux adapter name, such as `hci0` or `hci1`, and disable Home Assistant's use of **that dongle**. Keep the dongle plugged in and leave your regular adapter enabled. The Bridge needs direct access to its dongle to receive connections from the remote. [Find your Bluetooth adapters](https://www.home-assistant.io/connectivity/bluetooth/#viewing-your-bluetooth-adapters-and-proxies)
+3. In the Bridge's **Configuration** tab, set **Bluetooth adapter** (`adapter`) to the name from step 2. For a new setup, replace **Bridge device key** (`device_key`) with a private random value of 32 characters using only `0–9` and `a–f`. If you already use the Bridge, keep your existing key so your remotes can still connect.
 4. Leave **Addresses (optional)** empty for automatic setup. Save, start the Bridge and enable **Start on boot**. The **Log** tab should show `multi-address bridge running`.
 
 ## Add your first remote
@@ -28,7 +28,7 @@ To add another Bridge remote, repeat step 1. Studio chooses a free address autom
 For a new setup, fill in **Bluetooth adapter** and **Bridge device key**. Leave the other fields at their defaults. If you use **Edit in YAML**, this is what a complete configuration looks like:
 
 ```yaml
-adapter: "02:11:22:33:44:55"
+adapter: "hci1"
 device_key: "f1a09c4b7d2e658301be4d96c8a72f50"
 addresses: ""
 remote_address: ""
@@ -39,14 +39,14 @@ conn_interval_min_ms: 7.5
 conn_interval_max_ms: 15.0
 ```
 
-Replace the example adapter address with your dongle's Bluetooth address. The example key is public. Generate your own with a password manager set to generate 32 characters from `0123456789abcdef`, or run `openssl rand -hex 16` in a terminal. Paste the resulting key into the Bridge and into Remote Studio when prompted.
+Replace `hci1` with your dedicated dongle's adapter name. The example key is public. Generate your own with a password manager set to generate 32 characters from `0123456789abcdef`, or run `openssl rand -hex 16` in a terminal. Paste the resulting key into the Bridge and into Remote Studio when prompted.
 
 | Setting | What it does |
 | --- | --- |
-| **Bluetooth adapter** (`adapter`) | Enter the address of the dedicated dongle as six colon-separated pairs, for example `02:11:22:33:44:55`. A name such as `hci1` also works, but can change after a restart or replug. |
+| **Bluetooth adapter** (`adapter`) | Enter the dedicated dongle's Linux adapter name, for example `hci0` or `hci1`. Check the name again if you reconnect the dongle or change the USB setup. |
 | **Bridge device key** (`device_key`) | Enter 32 hexadecimal characters as one string, without spaces. Use the same key in Remote Studio. |
 | **Addresses (optional)** (`addresses`) | Leave blank in the form or use `""` in YAML for automatic allocation. To prioritize specific addresses, enter one comma-separated string such as `C0:12:34:56:78:90, C1:12:34:56:78:90`. Each new custom virtual address must start with `C0`–`FF`. |
-| **Universal Remote address (optional)** (`remote_address`) | Leave blank in the form or use `""` in YAML for a standard install. For diagnostics, enter the Bluetooth address of the physical remote, for example `02:66:77:88:99:AA`. Find it on the Universal Remote's integration page in Home Assistant. |
+| **Universal Remote address (optional)** (`remote_address`) | Leave blank or use `""` in YAML. Remote Studio sends the physical remote's saved address to the Bridge when it needs to read or change the device. If set here, the Bridge adds this address to MQTT button events and uses it to filter Bluetooth traces. Enter the physical remote's MAC, for example `02:66:77:88:99:AA`. |
 | **MQTT button topic** (`mqtt_topic`) | Keep `switchbot_urc/button` so Remote Studio receives button events. |
 | **MQTT discovery** (`discovery`) | Leave on (`true`) to create the MQTT button event entity and device triggers in Home Assistant. |
 | **Bluetooth trace logging** (`hci_trace`) | Leave off (`false`) for normal use. Turn on temporarily to collect a detailed Bluetooth log. |

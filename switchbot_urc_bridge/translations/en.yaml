@@ -1,7 +1,7 @@
 configuration:
   adapter:
     name: "Bluetooth adapter"
-    description: "Enter the Bluetooth address of the dedicated USB dongle, for example 02:11:22:33:44:55."
+    description: "Enter the Linux adapter name of the dedicated USB dongle, for example hci0 or hci1."
   device_key:
     name: "Bridge device key"
     description: "Enter a private key of 32 hexadecimal characters, using only 0–9 and a–f. Enter the same key in Remote Studio. Keep your existing key if you already have working remotes."
@@ -10,7 +10,7 @@ configuration:
     description: "Leave empty for automatic allocation. To prioritize addresses, enter a comma-separated list, for example C0:12:34:56:78:90, C1:12:34:56:78:90."
   remote_address:
     name: "Universal Remote address (optional)"
-    description: "Leave empty for normal use. For diagnostics, enter the Bluetooth address of the physical remote, for example 02:66:77:88:99:AA."
+    description: "Refresh uses the remote address saved in the integration. Enter the physical remote's address here only to label button events and filter Bluetooth traces, for example 02:66:77:88:99:AA."
   mqtt_topic:
     name: "MQTT button topic"
     description: "Keep switchbot_urc/button for use with Remote Studio."
