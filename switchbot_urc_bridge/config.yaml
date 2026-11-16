@@ -2,7 +2,7 @@ name: SwitchBot URC Bridge
 version: "0.32.0"
 slug: switchbot_urc_bridge
 description: >-
-  Fake native SwitchBot target for receiving encrypted button commands directly from WoRWS.
+  Use your SwitchBot Universal Remote to control lights, scenes, and scripts in Home Assistant.
 url: https://github.com/batareya16/switchbot-urc-addon
 arch:
   - aarch64
