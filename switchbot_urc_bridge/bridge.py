@@ -21,6 +21,7 @@ Config comes from environment variables set by run.sh:
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import ctypes
 import json
 import logging
@@ -31,6 +32,7 @@ import signal
 import socket
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -40,7 +42,7 @@ import hci_multi
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _LOG = logging.getLogger("bridge")
-BRIDGE_VERSION = "0.31.3"
+BRIDGE_VERSION = "0.31.5"
 
 SVC = "cba20d00-224d-11e6-9fb8-0002a5d5c51b"
 CHAR_WRITE = "cba20002-224d-11e6-9fb8-0002a5d5c51b"
@@ -1289,6 +1291,7 @@ def publish_with_retry(
     delay_seconds: int = 3,
     raw_advertiser: RawMgmtAdvertiser | None = None,
     raw_att_server=None,
+    advertisement_ready: threading.Event | None = None,
 ) -> None:
     """Register GATT then raw advertising, with a known-good D-Bus fallback."""
     import dbus
@@ -1299,6 +1302,8 @@ def publish_with_retry(
             if raw_advertiser is None:
                 raise RuntimeError("raw ATT requires raw advertising")
             raw_advertiser.register()
+            if advertisement_ready is not None:
+                advertisement_ready.set()
             _LOG.info("direct ATT transport active; BlueZ D-Bus GATT is bypassed")
             periph.mainloop.run()
             return
@@ -1325,6 +1330,11 @@ def publish_with_retry(
         "advert_started": False,
     }
 
+    def advertisement_registered() -> None:
+        if advertisement_ready is not None:
+            advertisement_ready.set()
+        _LOG.info("Advertisement registered")
+
     def register_advertisement() -> bool:
         if state["advert_started"]:
             return False
@@ -1335,7 +1345,7 @@ def publish_with_retry(
         periph.ad_manager.advert_mngr_methods.RegisterAdvertisement(
             periph.advert.path,
             dbus.Dictionary({}, signature="sv"),
-            reply_handler=lambda: _LOG.info("Advertisement registered"),
+            reply_handler=advertisement_registered,
             error_handler=lambda error: advertisement_failed(error, attempt),
         )
         return False
@@ -1365,6 +1375,8 @@ def publish_with_retry(
         if raw_advertiser is not None:
             try:
                 raw_advertiser.register()
+                if advertisement_ready is not None:
+                    advertisement_ready.set()
                 return
             except (OSError, TimeoutError, RuntimeError) as err:
                 _LOG.warning(
@@ -1497,10 +1509,62 @@ def add_bridge_characteristics(periph, device) -> None:
 
 
 class NativeSessionHistory:
-    """Keep recent issued IVs across raw HCI reconnects, scoped to the fake target."""
+    """Keep recent issued IVs scoped to the BLE target, including across a clean restart."""
+
+    LIFETIME = 60
 
     def __init__(self) -> None:
         self._targets: dict[str, dict[bytes, tuple[float, int, set[bytes]]]] = {}
+
+    def save(self, path: pathlib.Path) -> None:
+        """Checkpoint on shutdown so serving an ATT request never waits for disk I/O."""
+        monotonic_now, wall_now = time.monotonic(), time.time()
+        rows = [
+            [target, iv.hex(), wall_now + issued - monotonic_now + self.LIFETIME,
+             key_id, [command.hex() for command in frames]]
+            for target, sessions in self._targets.items()
+            for iv, (issued, key_id, frames) in sessions.items()
+            if monotonic_now - issued < self.LIFETIME
+        ]
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as output:
+                temporary = pathlib.Path(output.name)
+                json.dump(rows, output)
+            temporary.replace(path)
+        except OSError as err:
+            _LOG.warning("could not save recent native sessions: %s", err)
+            if temporary is not None:
+                with suppress(OSError):
+                    temporary.unlink(missing_ok=True)
+
+    def load(self, path: pathlib.Path) -> None:
+        try:
+            rows = json.loads(path.read_text())
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as err:
+            _LOG.warning("could not load recent native sessions: %s", err)
+            return
+        if not isinstance(rows, list):
+            return
+        monotonic_now, wall_now = time.monotonic(), time.time()
+        for row in rows[-1024:]:
+            try:
+                target, iv_hex, expires_at, key_id, saved_frames = row
+                iv = bytes.fromhex(iv_hex)
+                remaining = float(expires_at) - wall_now
+                if (not isinstance(target, str) or not hci_multi.is_address(target)
+                        or len(iv) != 16 or type(key_id) is not int or not 0 <= key_id <= 255
+                        or not 0 < remaining <= self.LIFETIME or not isinstance(saved_frames, list)):
+                    continue
+                frames = {bytes.fromhex(command) for command in saved_frames[:64]}
+            except (TypeError, ValueError):
+                continue
+            self.issue(target, iv, key_id)
+            self._targets[target][iv] = (
+                monotonic_now + remaining - self.LIFETIME, key_id, frames,
+            )
 
     def _sessions(self, target: str):
         if not target or target == "?":
@@ -1508,7 +1572,7 @@ class NativeSessionHistory:
         sessions = self._targets.setdefault(target, {})
         now = time.monotonic()
         for iv, (issued, _key_id, _frames) in list(sessions.items()):
-            if now - issued >= 60:
+            if now - issued >= self.LIFETIME:
                 del sessions[iv]
         while len(self._targets) > 32:
             self._targets.pop(next(iter(self._targets)))
@@ -1693,8 +1757,8 @@ class SwitchBotDevice:
                 _LOG.info("duplicate encrypted command acknowledged without a second HA event")
             else:
                 self._on_button(label, full.hex(), remote_id, remote_slot)
-                if self._session_history is not None:
-                    self._session_history.remember(self._target_address(), iv, full)
+            if self._session_history is not None:
+                self._session_history.remember(self._target_address(), iv, full)
             return
         _LOG.info("unhandled write (no IV yet / bad frame): %s", raw.hex())
 
@@ -2248,6 +2312,10 @@ class Mqtt:
                 return
             request_id = str(payload.get("request_id", ""))
             action = str(payload.get("action", ""))
+            if action == "addresses":
+                meant_for = str(payload.get("adapter_address") or "")
+                if meant_for and hci_multi.normalise(meant_for) != hci_multi.normalise(adapter_address):
+                    return
             ok = False
             error = ""
             try:
@@ -2553,6 +2621,8 @@ def run_multi_address(
         return False
 
     session_history = NativeSessionHistory()
+    session_path = pathlib.Path("/data/native_sessions.json")
+    session_history.load(session_path)
     server = hci_multi.MultiAddressServer(
         name,
         addresses,
@@ -2568,10 +2638,12 @@ def run_multi_address(
         ),
         conn_min=WORWS_CONN_MIN,
         conn_max=WORWS_CONN_MAX,
+        advertising_interval_ms=BRIDGE_ADV_INTERVAL * 0.625,
     )
 
     def _shutdown(*_args) -> None:
         server.stop()
+        session_history.save(session_path)
         os._exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -2591,15 +2663,6 @@ def run_multi_address(
             return server.resume()
         # "addresses": Remote Studio allocated a new address and needs this controller to serve
         # it before the tile bound to it is ever pressed.
-        meant_for = str((payload or {}).get("adapter_address") or "")
-        if meant_for and hci_multi.normalise(meant_for) != hci_multi.normalise(
-            server.own_public
-        ):
-            # Every add-on instance subscribes to the same control topic, so a request naming
-            # another controller is not ours. Replacing our address list with its would stop
-            # answering every tile bound here.
-            _LOG.info("ignoring an addresses request meant for %s", meant_for)
-            return True
         wanted = list((payload or {}).get("addresses") or [])
         served = server.set_addresses(wanted)
         _remember_addresses(served)
@@ -2616,10 +2679,10 @@ def run_multi_address(
             address, key_hex, key_id, steps, crypt=aes_ctr),
     )
     _LOG.info(
-        "multi-address bridge running on %s for %s; bind each native tile's target MAC to one "
-        "of these addresses",
+        "multi-address bridge running on %s for %s; advertising interval %.2f ms",
         adapter,
         ", ".join(addresses),
+        server.interval * 0.625,
     )
     # From here this call owns the process; it only ever returns False, above, when it
     # declined to take the controller.
@@ -2820,17 +2883,14 @@ def main() -> None:
         _LOG.info("direct ATT transport disabled; using BlueZ GATT")
 
     bridge_state = {"paused": False}
+    advertisement_ready = threading.Event()
 
     def _bridge_control(action: str, _payload: dict | None = None) -> bool:
         if action == "addresses":
-            # This path serves exactly one address, the controller's own. Everything after the
-            # pause branch is the resume branch, so without this an addresses request would be
-            # answered with a cheerful success and Remote Studio would believe a tile it just
-            # bound is being advertised when nothing is.
-            raise RuntimeError(
-                "this bridge serves a single address; set the add-on's `addresses` option to "
-                "use several, which needs a Bluetooth 5 controller"
-            )
+            wanted = {hci_multi.normalise(item) for item in (_payload or {}).get("addresses", [])}
+            if wanted == {hci_multi.normalise(adapter_address)}:
+                return advertisement_ready.is_set() and not bridge_state["paused"]
+            raise RuntimeError(f"this bridge is serving only {adapter_address}")
         if action == "pause":
             if bridge_state["paused"]:
                 # Idempotent: a retry/duplicate request while already paused is a no-op success.
@@ -2900,6 +2960,7 @@ def main() -> None:
         periph,
         raw_advertiser=raw_advertiser,
         raw_att_server=raw_att_server,
+        advertisement_ready=advertisement_ready,
     )
 
 
