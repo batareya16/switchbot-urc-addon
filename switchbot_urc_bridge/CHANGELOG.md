@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.3
+
+- Simplifies the setup guide for adding Bridge remotes from Remote Studio.
+
 ## 0.32.2
 
 - Shows Linux adapter names such as `hci0` and `hci1` in setup examples.
