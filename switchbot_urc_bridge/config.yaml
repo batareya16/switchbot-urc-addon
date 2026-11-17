@@ -1,5 +1,5 @@
 name: SwitchBot URC Bridge
-version: "0.32.3"
+version: "0.32.4"
 slug: switchbot_urc_bridge
 description: >-
   Use your SwitchBot Universal Remote to control lights, scenes, and scripts in Home Assistant.
@@ -31,7 +31,6 @@ options:
   hci_trace: false
   conn_interval_min_ms: 7.5
   conn_interval_max_ms: 15.0
-  device_key: "00112233445566778899aabbccddeeff"
 schema:
   adapter: str
   addresses: str?
@@ -41,4 +40,3 @@ schema:
   hci_trace: bool
   conn_interval_min_ms: float?
   conn_interval_max_ms: float?
-  device_key: str?

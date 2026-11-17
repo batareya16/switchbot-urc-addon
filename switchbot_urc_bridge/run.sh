@@ -3,7 +3,7 @@
 set -e
 
 # Supervisor can retain the options saved by older releases.
-for option in name diagnostic_scan prewarm_remote_cache direct_att raw_att_idle_timeout \
+for option in name device_key diagnostic_scan prewarm_remote_cache direct_att raw_att_idle_timeout \
   raw_att_keepalive_interval raw_att_keepalive_window; do
   if bashio::config.exists "${option}"; then
     bashio::addon.option "${option}" || bashio::log.warning "Could not remove obsolete option ${option}"
@@ -37,7 +37,6 @@ case "${CONN_INTERVAL_MIN_MS}:${CONN_INTERVAL_MAX_MS}" in
     bashio::log.info "Migrated BLE connection interval from legacy 15-30ms to 7.5-15ms"
     ;;
 esac
-DEVICE_KEY="$(bashio::config 'device_key')"
 
 if bashio::services.available "mqtt"; then
   export MQTT_HOST="$(bashio::services mqtt 'host')"
@@ -49,7 +48,7 @@ else
   bashio::log.warning "No MQTT service — button events will only be logged."
 fi
 
-export ADAPTER ADDRESSES REMOTE_ADDRESS TOPIC DISCOVERY HCI_TRACE DEVICE_KEY
+export ADAPTER ADDRESSES REMOTE_ADDRESS TOPIC DISCOVERY HCI_TRACE
 export CONN_INTERVAL_MIN_MS CONN_INTERVAL_MAX_MS
 
 bashio::log.info "Starting SwitchBot URC Bridge on adapter ${ADAPTER}"

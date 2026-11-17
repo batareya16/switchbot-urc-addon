@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.4
+
+- Receive open button commands and remove the Bridge device key option.
+
 ## 0.32.3
 
 - Simplifies the setup guide for adding Bridge remotes from Remote Studio.

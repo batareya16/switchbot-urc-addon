@@ -11,7 +11,6 @@ Config comes from environment variables set by run.sh:
   TOPIC                       MQTT button event topic
   DISCOVERY                   Publish HA MQTT discovery
   HCI_TRACE "true"/"false"    log controller diagnostics plus one remote ATT session
-  DEVICE_KEY 32 hex (optional) only needed if the remote->device link is encrypted
   MQTT_HOST/MQTT_PORT/MQTT_USER/MQTT_PASS  broker (from the MQTT service)
 """
 from __future__ import annotations
@@ -34,7 +33,7 @@ import hci_multi
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _LOG = logging.getLogger("bridge")
-BRIDGE_VERSION = "0.32.3"
+BRIDGE_VERSION = "0.32.4"
 
 SVC = "cba20d00-224d-11e6-9fb8-0002a5d5c51b"
 CHAR_WRITE = "cba20002-224d-11e6-9fb8-0002a5d5c51b"
@@ -323,113 +322,14 @@ def _write_json_atomically(path: pathlib.Path, payload) -> None:
                 temporary.unlink(missing_ok=True)
 
 
-class NativeSessionHistory:
-    """Keep recent issued IVs scoped to the BLE target, including across a clean restart."""
-
-    LIFETIME = 60
-
-    def __init__(self) -> None:
-        self._targets: dict[str, dict[bytes, tuple[float, int, set[bytes]]]] = {}
-
-    def save(self, path: pathlib.Path) -> None:
-        """Checkpoint on shutdown so serving an ATT request never waits for disk I/O."""
-        monotonic_now, wall_now = time.monotonic(), time.time()
-        rows = [
-            [target, iv.hex(), wall_now + issued - monotonic_now + self.LIFETIME,
-             key_id, [command.hex() for command in frames]]
-            for target, sessions in self._targets.items()
-            for iv, (issued, key_id, frames) in sessions.items()
-            if monotonic_now - issued < self.LIFETIME
-        ]
-        try:
-            _write_json_atomically(path, rows)
-        except OSError as err:
-            _LOG.warning("could not save recent native sessions: %s", err)
-
-    def load(self, path: pathlib.Path) -> None:
-        try:
-            rows = json.loads(path.read_text())
-        except FileNotFoundError:
-            return
-        except (OSError, ValueError) as err:
-            _LOG.warning("could not load recent native sessions: %s", err)
-            return
-        if not isinstance(rows, list):
-            return
-        monotonic_now, wall_now = time.monotonic(), time.time()
-        for row in rows[-1024:]:
-            try:
-                target, iv_hex, expires_at, key_id, saved_frames = row
-                iv = bytes.fromhex(iv_hex)
-                remaining = float(expires_at) - wall_now
-                if (not isinstance(target, str) or not hci_multi.is_address(target)
-                        or len(iv) != 16 or type(key_id) is not int or not 0 <= key_id <= 255
-                        or not 0 < remaining <= self.LIFETIME or not isinstance(saved_frames, list)):
-                    continue
-                frames = {bytes.fromhex(command) for command in saved_frames[:64]}
-            except (TypeError, ValueError):
-                continue
-            self.issue(target, iv, key_id)
-            self._targets[target][iv] = (
-                monotonic_now + remaining - self.LIFETIME, key_id, frames,
-            )
-
-    def _sessions(self, target: str):
-        if not target or target == "?":
-            return {}
-        sessions = self._targets.setdefault(target, {})
-        now = time.monotonic()
-        for iv, (issued, _key_id, _frames) in list(sessions.items()):
-            if now - issued >= self.LIFETIME:
-                del sessions[iv]
-        while len(self._targets) > 32:
-            self._targets.pop(next(iter(self._targets)))
-        return sessions
-
-    def issue(self, target: str, iv: bytes, key_id: int) -> None:
-        sessions = self._sessions(target)
-        sessions[iv] = (time.monotonic(), key_id, set())
-        while len(sessions) > 32:
-            sessions.pop(next(iter(sessions)))
-
-    def candidates(self, target: str, key_id: int) -> list[bytes]:
-        return [iv for iv, (_issued, issued_key, _frames) in self._sessions(target).items()
-                if issued_key == key_id]
-
-    def delivered(self, target: str, iv: bytes, command: bytes) -> bool:
-        session = self._sessions(target).get(iv)
-        return session is not None and command in session[2]
-
-    def remember(self, target: str, iv: bytes, command: bytes) -> None:
-        session = self._sessions(target).get(iv)
-        if session is not None:
-            # Repeated identical commands occupy one entry. Bound unusual traffic as well.
-            if command in session[2]:
-                return
-            if len(session[2]) >= 64:
-                del self._targets[target][iv]
-                return
-            session[2].add(command)
-
-
 class SwitchBotDevice:
-    """Device-side protocol: get-random handshake + AES-CTR decrypt of the remote's commands."""
+    """Receive open button commands from WoRWS Native remotes."""
 
-    def __init__(self, key: bytes, notify, on_button, *, session_history=None,
-                 target_address=None) -> None:
-        self._key = key
-        self._notify = notify          # callable(bytes) -> notify on cba20003
-        self._on_button = on_button     # callable(label, plain_hex, remote_id, remote_slot)
-        self._iv: bytes | None = None
-        # The remote asks for several randoms in a row and then sends a frame for each, so the
-        # newest IV is not always the one a frame was encrypted with. Keep the recent ones,
-        # keyed by the two bytes every frame carries to name its session.
-        self._sessions: dict[bytes, bytes] = {}
-        self._key_id = 0x95
+    def __init__(self, notify, on_button) -> None:
+        self._notify = notify
+        self._on_button = on_button
         self._last_command: bytes | None = None
         self._last_command_at = 0.0
-        self._session_history = session_history
-        self._target_address = target_address or (lambda: "")
 
     def _is_immediate_retry(self, command: bytes) -> bool:
         """Recognize the firmware retry caused by a late/lost application ACK."""
@@ -438,31 +338,6 @@ class SwitchBotDevice:
         self._last_command = bytes(command)
         self._last_command_at = now
         return repeated
-
-    def _decrypt_command(self, raw: bytes) -> tuple[bytes | None, bytes]:
-        """Find the session a command frame belongs to, and decrypt it.
-
-        Bytes 2-3 name the session, and normally that is the answer. Try this connection's
-        remembered IVs and recent IVs issued by this fake target before a reconnect. Only an
-        IV that decrypts the payload into a recognized bridge event can recover a press.
-        """
-        named = self._sessions.get(bytes(raw[2:4]))
-        candidates = [named] if named else []
-        candidates += [iv for iv in self._sessions.values() if iv is not named]
-        if self._session_history is not None:
-            candidates += [iv for iv in self._session_history.candidates(self._target_address(), raw[1])
-                           if iv not in candidates]
-        for candidate in candidates:
-            plain = aes_ctr(self._key, candidate, raw[4:])
-            remote_id, _slot = decode_event_source(b"\x57" + plain)
-            if remote_id is not None:
-                if candidate is not named:
-                    _LOG.info(
-                        "frame named session %s but decrypts under %s; using that one",
-                        raw[2:4].hex(), candidate[:2].hex(),
-                    )
-                return candidate, plain
-        return None, b""
 
     def on_write(self, raw: bytes) -> None:
         _LOG.info("REMOTE wrote: %s", raw.hex())
@@ -493,82 +368,7 @@ class SwitchBotDevice:
             else:
                 self._on_button(label, ph, remote_id, remote_slot)
             return
-        # get-random handshake: 57 00 00 00 0F 21 03 <keyId> -> reply 01 00 00 00 <16B IV>.
-        if (len(raw) >= 8 and raw[0] == 0x57 and raw[1:5] == b"\x00\x00\x00\x0f"
-                and raw[5:7] == b"\x21\x03"):
-            self._key_id = raw[7] if len(raw) > 7 else 0x95
-            self._iv = os.urandom(16)
-            self._sessions[self._iv[:2]] = self._iv
-            if self._session_history is not None:
-                self._session_history.issue(self._target_address(), self._iv, self._key_id)
-            # Bounded: a remote that keeps asking must not grow this without end.
-            while len(self._sessions) > 16:
-                self._sessions.pop(next(iter(self._sessions)))
-            _LOG.info("handshake get-random -> IV=%s", self._iv.hex())
-            self._notify(bytes([0x01, 0x00, 0x00, 0x00]) + self._iv)
-            return
-        # Encrypted command: 57 <keyId> <nonce0> <nonce1> <ciphertext>.
-        if (len(raw) >= 4 and raw[0] == 0x57
-                and (self._iv is not None or self._session_history is not None)):
-            if self._iv is not None and raw[1] != self._key_id:
-                _LOG.warning("encrypted frame uses unexpected keyId=%02x (expected %02x)",
-                             raw[1], self._key_id)
-            # Bytes 2-3 name the session: they are the first two bytes of the IV the frame was
-            # encrypted with. Look it up rather than assuming the newest one — the remote
-            # pipelines several get-randoms and then sends a frame for each, so the match is
-            # often an earlier IV. A frame naming a session we never issued would decrypt to
-            # noise and reach Home Assistant as a button press that never happened.
-            iv, plain = self._decrypt_command(raw)
-            if iv is None:
-                _LOG.info(
-                    "ignoring frame naming session %s: no current or retained IV decrypts "
-                    "it into a press (current sessions: %s)",
-                    raw[2:4].hex(),
-                    ", ".join(key.hex() for key in self._sessions) or "none",
-                )
-                return
-            ph = plain.hex()
-            _LOG.info("decrypted command: %s", ph)
-            # The remote relays the stored key command with its leading 0x57 magic consumed as the
-            # frame magic, so the decrypted payload lacks it (e.g. f00306... instead of 57f00306...).
-            # Restore it so the v3 bridge event decodes with its remote_id/slot/button, exactly like
-            # an unencrypted native write; otherwise every press is logged as UNKNOWN/legacy.
-            full = b"\x57" + plain
-            metadata = decode_event_metadata(full)
-            key_fun = metadata.get("button_function")
-            label = decode_button(
-                str(metadata["command"]),
-                int(key_fun) if key_fun is not None else None,
-                str(metadata.get("device_type", "")),
-            )
-            # Guaranteed to parse: `_decrypt_command` only returns a plaintext that does.
-            remote_id, remote_slot = decode_event_source(full)
-            _LOG.info(
-                ">>> BUTTON: %s remote_id=%s slot=%s", label, remote_id, remote_slot
-            )
-            # ACK before MQTT: first-use discovery can take about 100 ms, long enough for WoRWS
-            # to retransmit the command.
-            # Acknowledged in the frame's own session, not the newest one, or the remote
-            # cannot match the answer to the command it sent.
-            recovered = iv not in self._sessions.values()
-            ack = aes_ctr(self._key, iv, bytes([0x01]))
-            self._notify(bytes([0x01, raw[1], iv[0], iv[1]]) + ack)
-            if recovered:
-                _LOG.info("recovered encrypted command from a recent connection: session=%s",
-                          iv[:2].hex())
-                if self._session_history.delivered(self._target_address(), iv, full):
-                    _LOG.info("previously delivered encrypted command acknowledged without a second HA event")
-                    return
-            # Publish unknown commands too: the first live press is protocol evidence and must
-            # not disappear merely because the local map does not know it yet.
-            if self._is_immediate_retry(full):
-                _LOG.info("duplicate encrypted command acknowledged without a second HA event")
-            else:
-                self._on_button(label, full.hex(), remote_id, remote_slot)
-            if self._session_history is not None:
-                self._session_history.remember(self._target_address(), iv, full)
-            return
-        _LOG.info("unhandled write (no IV yet / bad frame): %s", raw.hex())
+        _LOG.info("unhandled write: %s", raw.hex())
 
 
 def _uuid128_le(value: str) -> bytes:
@@ -1169,7 +969,6 @@ def _recall_addresses() -> list[str]:
 def run_multi_address(
     adapter: str,
     configured: list[str],
-    key: bytes,
     mq: "Mqtt",
     remote_address: str,
 ) -> None:
@@ -1183,21 +982,15 @@ def run_multi_address(
     remembered = _recall_addresses()
     addresses = [*configured, *remembered]
 
-    session_history = NativeSessionHistory()
-    session_path = pathlib.Path("/data/native_sessions.json")
-    session_history.load(session_path)
     server = hci_multi.MultiAddressServer(
         name,
         addresses,
         protocol_factory=FastAttProtocol,
-        device_factory=lambda notify, address_of: SwitchBotDevice(
-            key,
+        device_factory=lambda notify, _address_of: SwitchBotDevice(
             notify,
             lambda label, ph, remote_id, remote_slot: mq.publish(
                 label, ph, remote_id=remote_id, remote_slot=remote_slot
             ),
-            session_history=session_history,
-            target_address=address_of,
         ),
         conn_min=WORWS_CONN_MIN,
         conn_max=WORWS_CONN_MAX,
@@ -1207,7 +1000,6 @@ def run_multi_address(
 
     def _shutdown(*_args) -> None:
         server.stop()
-        session_history.save(session_path)
         os._exit(0)
 
     if os.environ.get("HCI_TRACE", "false").lower() == "true":
@@ -1252,21 +1044,12 @@ def main() -> None:
     remote_address = os.environ.get("REMOTE_ADDRESS", "").strip()
     topic = os.environ.get("TOPIC", "switchbot_urc/button")
     discovery = os.environ.get("DISCOVERY", "true").lower() == "true"
-    # The ctr-key we assigned to the remote for this device (urc_test --secret-key / 0F 20 09).
-    key_hex = os.environ.get("DEVICE_KEY") or "00112233445566778899aabbccddeeff"
-    try:
-        key = bytes.fromhex(key_hex)
-    except ValueError as err:
-        raise SystemExit("DEVICE_KEY must be exactly 32 hexadecimal characters") from err
-    if len(key) != 16:
-        raise SystemExit("DEVICE_KEY must be exactly 32 hexadecimal characters")
-
     mq = Mqtt(topic, discovery, remote_address)
 
     configured = [item.strip() for item in os.environ.get("ADDRESSES", "").split(",")
                   if item.strip()]
     try:
-        run_multi_address(adapter, configured, key, mq, remote_address)
+        run_multi_address(adapter, configured, mq, remote_address)
     except (RuntimeError, OSError) as err:
         raise SystemExit(f"Could not start the raw HCI bridge on {adapter}: {err}") from err
 

@@ -2,9 +2,6 @@ configuration:
   adapter:
     name: "Bluetooth adapter"
     description: "Enter the Linux adapter name of the dedicated USB dongle, for example hci0 or hci1."
-  device_key:
-    name: "Bridge device key"
-    description: "Optional 32-character hexadecimal key for encrypted button commands."
   addresses:
     name: "Addresses (optional)"
     description: "Leave empty for automatic allocation. To prioritize addresses, enter a comma-separated list, for example C0:12:34:56:78:90, C1:12:34:56:78:90."
