@@ -596,7 +596,7 @@ class AttManagementClient:
         deadline = time.monotonic() + timeout
         first = self.await_notification(
             lambda data: len(data) >= 8 and data[:4] == b"\x01\x00\x00\x00", timeout)
-        if sub != 5:
+        if sub not in (4, 5):
             return first
         frame = bytearray(first)
         length = 8 + int.from_bytes(frame[4:6], "big")

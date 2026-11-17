@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.5
+
+- Reassemble fragmented scene list replies for Remote Studio.
+
 ## 0.32.4
 
 - Receive open button commands and remove the Bridge device key option.
