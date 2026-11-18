@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.53.2
+
+- The remote often refuses the first one or two connection attempts; this is routine, so a refused attempt is now logged at info level and the add-on tries up to six times before it reports a failure.
+- Large uploads to the remote no longer pause 50 ms after every chunk, and the log shows how long such an upload took and which ATT MTU the remote granted.
+
 ## 0.52.2
 
 - Align the Bridge add-on version with integration release 0.52.2.

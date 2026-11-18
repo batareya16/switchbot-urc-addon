@@ -72,7 +72,9 @@ LE_CONNECTION_COMPLETE = 0x01
 LE_ENHANCED_CONNECTION_COMPLETE = 0x0A
 LE_ADV_SET_TERMINATED = 0x12
 
-MANAGEMENT_CONNECT_ATTEMPTS = 4
+# The remote often refuses the first one or two connection attempts (0x3e) and accepts a later
+# one, so a refused attempt is routine, not an error; only running out of attempts is.
+MANAGEMENT_CONNECT_ATTEMPTS = 6
 MANAGEMENT_CONNECT_RETRY_DELAY = 0.15
 
 # Subevents 1..32. A narrower mask hides LE Advertising Set Terminated (0x12), which needs
@@ -1080,10 +1082,10 @@ class MultiAddressServer:
                 if not retryable_connect or attempt == MANAGEMENT_CONNECT_ATTEMPTS:
                     break
                 delay = MANAGEMENT_CONNECT_RETRY_DELAY * (2 ** (attempt - 1))
-                _LOG.warning(
-                    "raw HCI management connection failed before command write (%d/%d): %s; "
+                _LOG.info(
+                    "raw HCI management connection attempt %d of %d refused (%s); "
                     "retrying in %.2fs",
-                    attempt, MANAGEMENT_CONNECT_ATTEMPTS - 1, failure, delay)
+                    attempt, MANAGEMENT_CONNECT_ATTEMPTS, failure, delay)
                 time.sleep(delay)
 
             if failure is not None:
