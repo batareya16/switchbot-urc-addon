@@ -571,6 +571,10 @@ class AttManagementClient:
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"no WoRWS notification at {self.stage}")
 
+    CHUNK_PAUSE = 0.05
+    BULK_CHUNK_PAUSE = 0.005
+    BULK_FRAME_BYTES = 1024
+
     def write_frame(self, frame: bytes, *, response: bool = False) -> None:
         limit = self.mtu - 3
         if response:
@@ -581,12 +585,21 @@ class AttManagementClient:
             return
         if not self.write_properties & 0x04:
             raise RuntimeError("WoRWS management requires write-without-response support")
+        # The remote ends a management connection about 32 s after it opened, whatever is
+        # going on (three IR installs died at 32.0 s, always in the second 4 KiB code part).
+        # The official app waits only for the controller between chunks, so a bulk upload
+        # must not be throttled harder than the controller already does.
+        pause = self.BULK_CHUNK_PAUSE if len(frame) > self.BULK_FRAME_BYTES else self.CHUNK_PAUSE
+        started = time.monotonic()
         for off in range(0, len(frame), limit):
             self.send(struct.pack("<BH", 0x52, self.write_handle) + frame[off:off + limit])
             if off + limit < len(frame):
                 # Let ACL credits and other connections progress between application chunks.
-                if self.closed.wait(0.05):
+                if self.closed.wait(pause):
                     raise ConnectionError(self.error or "management connection closed")
+        if len(frame) > self.BULK_FRAME_BYTES:
+            _LOG.info("raw HCI management wrote %d bytes in %.2fs (ATT mtu %d, %d-byte chunks)",
+                      len(frame), time.monotonic() - started, self.mtu, limit)
 
     def read_query(self, sub: int, timeout: float) -> bytes:
         self.stage = f"query_0F63{sub:02X}"

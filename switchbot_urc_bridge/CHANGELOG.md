@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.52.2
+
+- Align the Bridge add-on version with integration release 0.52.2.
+
+## 0.52.1
+
+- Align the Bridge add-on version with integration release 0.52.1.
+
+## 0.52.0
+
+- Align the Bridge add-on version with integration release 0.52.0.
+
+## 0.51.4
+
+- Align the Bridge add-on version with integration release 0.51.4.
+
+## 0.51.3
+
+- Align the Bridge add-on version with the integration release.
+
 ## 0.32.5
 
 - Reassemble fragmented scene list replies for Remote Studio.
