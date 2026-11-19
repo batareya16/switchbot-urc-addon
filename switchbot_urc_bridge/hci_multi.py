@@ -76,6 +76,11 @@ LE_ADV_SET_TERMINATED = 0x12
 # one, so a refused attempt is routine, not an error; only running out of attempts is.
 MANAGEMENT_CONNECT_ATTEMPTS = 6
 MANAGEMENT_CONNECT_RETRY_DELAY = 0.15
+# Link supervision timeout of a management connection, in 10 ms units. The remote stops
+# answering the radio while it writes flash after an IR transfer, and 4 s (the old value)
+# dropped the link with "disconnected: 0x08" in the middle of an install. 20 s is the
+# default of the Android Bluetooth stack the official app connects with.
+MANAGEMENT_SUPERVISION_TIMEOUT = 2000
 
 # Subevents 1..32. A narrower mask hides LE Advertising Set Terminated (0x12), which needs
 # bit 17 and is the only event naming the set a connection arrived on.
@@ -653,6 +658,7 @@ class AttManagementClient:
             # Once any mutation may have reached the controller, never call a later error a
             # handshake/connect failure: the integration may retry those automatically.
             self.command_started = True
+            sent_at = time.monotonic()
             self.write_frame(frame)
 
             def decode(raw: bytes) -> bytes:
@@ -670,6 +676,8 @@ class AttManagementClient:
 
             raw = self.await_notification(matches, timeout)
             decoded = decode(raw)
+            _LOG.info("raw HCI management %s answered in %.2fs (%d bytes sent)",
+                      self.stage, time.monotonic() - sent_at, len(frame))
             self.responses.append(decoded.hex())
             accepted = step.get("accepted_codes")
             if accepted is not None and decoded[0] not in accepted:
@@ -1048,7 +1056,8 @@ class MultiAddressServer:
                         try:
                             self.channel.command(OP_LE_CREATE_CONN, struct.pack(
                                 "<HHBB6sBHHHHHH", 0x0060, 0x0060, 0, 0, address_bytes(peer), 0,
-                                self.conn_min, self.conn_max, 0, 400, 0, 0))
+                                self.conn_min, self.conn_max, 0,
+                                MANAGEMENT_SUPERVISION_TIMEOUT, 0, 0))
                         except HciCommandError:
                             initiated = False
                             raise

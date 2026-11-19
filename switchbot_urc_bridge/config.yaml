@@ -1,5 +1,5 @@
 name: SwitchBot URC Bridge
-version: "0.53.2"
+version: "0.53.4"
 slug: switchbot_urc_bridge
 description: >-
   Use your SwitchBot Universal Remote to control lights, scenes, and scripts in Home Assistant.

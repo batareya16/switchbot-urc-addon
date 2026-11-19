@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.53.4
+
+- Fixed the connection to the remote dropping in the middle of an IR remote install (`central disconnected: 0x08`). The remote stops answering the radio for several seconds while it stores the transferred code, and the 4 second link timeout ended the connection. The link timeout is now 20 seconds, the same as the official app uses.
+- The log now shows how long the remote took to answer each install step.
+
 ## 0.53.2
 
 - The remote often refuses the first one or two connection attempts; this is routine, so a refused attempt is now logged at info level and the add-on tries up to six times before it reports a failure.
