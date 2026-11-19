@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.53.5
+
+- The add-on now answers the remote's connection requests the way a phone does. When the remote asks to change the connection parameters (an L2CAP update request, or the link-layer request the controller hands to the host), the add-on accepts it; before, every non-ATT frame from the remote was ignored, which may be what made the remote stop answering when it entered synchronisation mode.
+- The log shows what the remote sends besides ATT data during a management session (L2CAP frames and connection, packet length and PHY updates), to find out why an install stalls.
+
 ## 0.53.4
 
 - Fixed the connection to the remote dropping in the middle of an IR remote install (`central disconnected: 0x08`). The remote stops answering the radio for several seconds while it stores the transferred code, and the 4 second link timeout ended the connection. The link timeout is now 20 seconds, the same as the official app uses.

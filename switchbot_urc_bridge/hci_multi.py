@@ -86,6 +86,13 @@ MANAGEMENT_SUPERVISION_TIMEOUT = 2000
 # bit 17 and is the only event naming the set a connection arrived on.
 LE_EVENT_MASK = bytes.fromhex("ffffffff00000000")
 ATT_CID = 0x0004
+SIGNALING_CID = 0x0005
+OP_LE_CONNECTION_UPDATE = 0x2013
+OP_LE_PARAM_REQUEST_REPLY = 0x2020
+LE_CONNECTION_UPDATE_COMPLETE = 0x03
+LE_REMOTE_PARAM_REQUEST = 0x06
+LE_DATA_LENGTH_CHANGE = 0x07
+LE_PHY_UPDATE_COMPLETE = 0x0C
 PB_FIRST = 0x00
 PB_CONTINUE = 0x01
 
@@ -349,6 +356,8 @@ class Link:
         self.device = device
         self.pending = bytearray()
         self.expected = 0
+        # L2CAP frames that are not ATT (signaling), as (channel id, payload).
+        self.other: list[tuple[int, bytes]] = []
 
     def feed(self, payload: bytes, first: bool):
         """Reassemble L2CAP B-frames; yield each complete ATT PDU."""
@@ -363,8 +372,11 @@ class Link:
         while self.expected and len(self.pending) >= self.expected:
             frame = bytes(self.pending[:self.expected])
             del self.pending[:self.expected]
-            if struct.unpack_from("<H", frame, 2)[0] == ATT_CID:
+            cid = struct.unpack_from("<H", frame, 2)[0]
+            if cid == ATT_CID:
                 yield frame[4:]
+            elif len(self.other) < 16:
+                self.other.append((cid, frame[4:]))
             self._resize()
 
     def _resize(self) -> None:
@@ -402,8 +414,8 @@ class AclWriter:
         self.pending = deque(item for item in self.pending if item[0] != handle)
         self._flush()
 
-    def send(self, handle: int, data: bytes) -> None:
-        frame = struct.pack("<HH", len(data), ATT_CID) + data
+    def send(self, handle: int, data: bytes, cid: int = ATT_CID) -> None:
+        frame = struct.pack("<HH", len(data), cid) + data
         fragments = (len(frame) + self.payload_size - 1) // self.payload_size
         if len(self.pending) + fragments > 512:
             raise BufferError("ACL output queue is full")
@@ -1214,10 +1226,64 @@ class MultiAddressServer:
                         else link.protocol.handle(pdu))
             if response is not None:
                 self.writer.send(handle, response)
+        if link.other:
+            frames, link.other = link.other, []
+            if link is self._central_link:
+                for cid, payload in frames:
+                    self._on_central_signaling(handle, cid, payload)
+
+    def _on_central_signaling(self, handle: int, cid: int, payload: bytes) -> None:
+        """Answer the remote's L2CAP signaling as a central must, and log it.
+
+        A phone answers the peripheral's connection-parameter update request; this bridge
+        ignored every non-ATT frame, which a peripheral that waits for the answer may not
+        survive.
+        """
+        _LOG.info("raw HCI management L2CAP cid=0x%04x from the remote: %s", cid, payload.hex())
+        if cid != SIGNALING_CID or len(payload) < 4:
+            return
+        code, ident = payload[0], payload[1]
+        if code == 0x12 and len(payload) >= 12:  # Connection Parameter Update Request
+            interval_min, interval_max, latency, timeout = struct.unpack_from("<HHHH", payload, 4)
+            accepted = (6 <= interval_min <= interval_max <= 3200 and latency <= 499
+                        and 10 <= timeout <= 3200)
+            self.writer.send(handle, struct.pack("<BBHH", 0x13, ident, 2, 0 if accepted else 1),
+                             SIGNALING_CID)
+            _LOG.info("raw HCI management remote asked for interval %.1f-%.1f ms, latency %d, "
+                      "timeout %d ms: %s", interval_min * 1.25, interval_max * 1.25, latency,
+                      timeout * 10, "accepted" if accepted else "rejected")
+            if accepted:
+                try:
+                    self.channel.command(OP_LE_CONNECTION_UPDATE, struct.pack(
+                        "<HHHHHHH", handle, interval_min, interval_max, latency, timeout, 0, 0))
+                except (HciCommandError, TimeoutError, OSError) as err:
+                    _LOG.warning("raw HCI management connection update failed: %s", err)
+        elif code in (0x02, 0x04, 0x06, 0x08, 0x0A, 0x14, 0x16, 0x1C):  # requests we do not serve
+            self.writer.send(handle, struct.pack("<BBHH", 0x01, ident, 2, 0), SIGNALING_CID)
 
     def _on_event(self, code: int, params: bytes) -> None:
         if code == EV_LE_META and params:
             subevent = params[0]
+            central = self._central_link
+            if central is not None and len(params) >= 4 and subevent in (
+                    LE_CONNECTION_UPDATE_COMPLETE, LE_REMOTE_PARAM_REQUEST,
+                    LE_DATA_LENGTH_CHANGE, LE_PHY_UPDATE_COMPLETE):
+                # Status comes first in the update-complete events; the others lead with the handle.
+                handle = struct.unpack_from("<H", params, 2 if subevent in (
+                    LE_CONNECTION_UPDATE_COMPLETE, LE_PHY_UPDATE_COMPLETE) else 1)[0]
+                if handle == central.handle:
+                    _LOG.info("raw HCI management LE event 0x%02x: %s", subevent, params.hex())
+                    if subevent == LE_REMOTE_PARAM_REQUEST and len(params) >= 11:
+                        # The controller waits for the host's answer to the remote's
+                        # LL connection-parameter request.
+                        interval_min, interval_max, latency, timeout = struct.unpack_from(
+                            "<HHHH", params, 3)
+                        try:
+                            self.channel.command(OP_LE_PARAM_REQUEST_REPLY, struct.pack(
+                                "<HHHHHHH", handle, interval_min, interval_max, latency,
+                                timeout, 0, 0))
+                        except (HciCommandError, TimeoutError, OSError) as err:
+                            _LOG.warning("raw HCI management parameter reply failed: %s", err)
             if subevent in (LE_CONNECTION_COMPLETE, LE_ENHANCED_CONNECTION_COMPLETE):
                 if params[1]:
                     if self._central_client is not None:
