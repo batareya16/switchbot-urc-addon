@@ -231,9 +231,13 @@ def probe_capabilities(index: int, timeout: float = 3.0) -> tuple[bool, int]:
     libc = ctypes.CDLL(None, use_errno=True)
     fd = libc.socket(af_bluetooth, sock_type, btproto_hci)
     if fd < 0:
+        _LOG.warning("hci%d probe: cannot open a Bluetooth management socket (errno %d)",
+                     index, ctypes.get_errno())
         return False, 1
     address = struct.pack("=HHH", af_bluetooth, HCI_DEV_NONE, HCI_CHANNEL_CONTROL)
     if libc.bind(fd, address, len(address)) < 0:
+        _LOG.warning("hci%d probe: cannot bind the management channel (errno %d)",
+                     index, ctypes.get_errno())
         os.close(fd)
         return False, 1
     sock = socket.socket(af_bluetooth, sock_type, btproto_hci, fileno=fd)
@@ -253,11 +257,20 @@ def probe_capabilities(index: int, timeout: float = 3.0) -> tuple[bool, int]:
             if command != MGMT_OP_READ_ADV_FEATURES:
                 continue
             if status or len(body) < 3 + 7:
+                _LOG.warning("hci%d probe: the kernel refused the advertising-features read "
+                             "(status 0x%02x); the controller may be missing, powered off or "
+                             "not hci%d any more", index, status, index)
                 return False, 1
             flags, _max_adv, _max_scan, sets = struct.unpack_from("<IBBB", body, 3)
+            if not flags & ADV_FLAG_EXTENDED:
+                _LOG.warning("hci%d probe: advertising flags 0x%08x show no extended advertising",
+                             index, flags)
             return bool(flags & ADV_FLAG_EXTENDED), max(1, sets)
+        _LOG.warning("hci%d probe: no answer from the kernel in %.0f s; the controller may be "
+                     "missing or stuck (replug the dongle)", index, timeout)
         return False, 1
-    except OSError:
+    except OSError as err:
+        _LOG.warning("hci%d probe: reading the advertising features failed: %s", index, err)
         return False, 1
     finally:
         sock.close()

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.53.6
+
+- When the Bluetooth adapter check fails at start, the log now says why (the adapter could not be opened, the kernel refused the query, or the adapter does not support connectable extended advertising). Before, every failure showed the same message "does not report extended advertising support", which also appeared when the adapter simply could not be opened.
+- The start error points to that log line.
+
 ## 0.53.5
 
 - The add-on now answers the remote's connection requests the way a phone does. When the remote asks to change the connection parameters (an L2CAP update request, or the link-layer request the controller hands to the host), the add-on accepts it; before, every non-ATT frame from the remote was ignored, which may be what made the remote stop answering when it entered synchronisation mode.

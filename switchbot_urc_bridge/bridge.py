@@ -33,7 +33,7 @@ import hci_multi
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _LOG = logging.getLogger("bridge")
-BRIDGE_VERSION = "0.53.5"
+BRIDGE_VERSION = "0.53.6"
 
 SVC = "cba20d00-224d-11e6-9fb8-0002a5d5c51b"
 CHAR_WRITE = "cba20002-224d-11e6-9fb8-0002a5d5c51b"
@@ -976,7 +976,8 @@ def run_multi_address(
     name, index, own = hci_multi.resolve_adapter(adapter)
     extended, sets = hci_multi.probe_capabilities(index)
     if not extended:
-        raise RuntimeError(f"{name} does not report extended advertising support. "
+        raise RuntimeError(f"{name} does not report extended advertising support (the probe line "
+                           "above says why). "
                            "SwitchBot URC Bridge requires a compatible Bluetooth 5 controller.")
     _LOG.info("%s (%s): extended advertising with %d set(s)", name, own or "address unknown", sets)
     remembered = _recall_addresses()
